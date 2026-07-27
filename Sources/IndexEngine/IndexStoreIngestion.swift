@@ -12,6 +12,14 @@ private struct PreparedChunk: Sendable {
     var characterEnd: Int
     var tokenStart: Int
     var tokenEnd: Int
+    /// 1-based inclusive line range within the normalized representation text — the unit every
+    /// downstream consumer (an editor jump, a file read, a code edit) actually takes.
+    var lineStart: Int
+    var lineEnd: Int
+    /// Text immediately before and after the chunk. Retrieval returns a window into a document;
+    /// without its edges a caller cannot tell whether a match sits mid-sentence or mid-function.
+    var contextPrefix: String
+    var contextSuffix: String
 }
 
 private struct PreparedEmbedding: Sendable {
@@ -22,7 +30,117 @@ private struct PreparedEmbedding: Sendable {
     var modality: EmbeddingModality
 }
 
+/// What a rebuild of the active embedding space actually managed to restore.
+public struct EmbeddingRebuildSummary: Sendable, Equatable {
+    /// Chunks re-embedded from their stored text.
+    public var rebuiltChunkCount: Int
+    /// Chunks whose vector came from a non-text modality. Their bytes are not in the store, so
+    /// they cannot be rebuilt from it — the document has to be ingested again from its source.
+    public var skippedNonTextChunkCount: Int
+
+    public init(rebuiltChunkCount: Int = 0, skippedNonTextChunkCount: Int = 0) {
+        self.rebuiltChunkCount = rebuiltChunkCount
+        self.skippedNonTextChunkCount = skippedNonTextChunkCount
+    }
+
+    /// Whether the rebuild left the index fully readable by the active embedder.
+    public var isComplete: Bool { skippedNonTextChunkCount == 0 }
+}
+
 extension IndexStore {
+    /// Re-embeds every active chunk that has no vector in the embedder's current space.
+    ///
+    /// This is the recovery path for a changed embedder. Retrieval filters every channel on the
+    /// active `embedding_space_id`, so a new model, a new dimension, or a regenerated model
+    /// manifest orphans the whole index and search goes quiet. Nothing about the *content* is
+    /// stale in that case — only the vectors — and the chunk text is already in the store, so the
+    /// repair reads no source files and needs none of them to still exist.
+    ///
+    /// Idempotent: chunks that already have a vector in the active space are skipped, so an
+    /// interrupted rebuild resumes rather than restarting.
+    public func rebuildActiveEmbeddingSpace(batchSize: Int = 32) async throws -> EmbeddingRebuildSummary {
+        let pending = try chunksMissingActiveEmbedding()
+        guard !pending.isEmpty else { return EmbeddingRebuildSummary() }
+
+        var summary = EmbeddingRebuildSummary(
+            skippedNonTextChunkCount: pending.count { !$0.isTextModality }
+        )
+        let rebuildable = pending.filter(\.isTextModality)
+
+        for batch in stride(from: 0, to: rebuildable.count, by: max(1, batchSize)).map({
+            Array(rebuildable[$0..<min($0 + max(1, batchSize), rebuildable.count)])
+        }) {
+            let vectors = try await embedder.embed(batch.map(\.text), kind: .document)
+            var prepared: [PreparedEmbedding] = []
+            prepared.reserveCapacity(batch.count)
+            for (index, chunk) in batch.enumerated() {
+                let vector = vectors[index]
+                try validateEmbedding(vector, kind: .document)
+                prepared.append(
+                    PreparedEmbedding(
+                        id: "\(chunk.id):embedding:\(embeddingSpaceID)",
+                        chunkID: chunk.id,
+                        vector: vector,
+                        vectorHash: Self.stableHash(
+                            "vector",
+                            Vector.toBytes(vector).map(String.init).joined(separator: ",")
+                        ),
+                        modality: .text
+                    )
+                )
+            }
+
+            // One transaction per batch: a rebuild can span a large corpus, and a failure part way
+            // through should leave the batches already written intact for the resume to skip.
+            let now = Date.now.timeIntervalSince1970
+            try db.transaction {
+                try self.persistEmbeddings(prepared, activeEmbeddingSpaceID: self.embeddingSpaceID, now: now)
+            }
+            summary.rebuiltChunkCount += prepared.count
+        }
+
+        return summary
+    }
+
+    private struct RebuildableChunk {
+        var id: String
+        var text: String
+        var isTextModality: Bool
+    }
+
+    /// Active chunks with no vector in the current space, tagged with the modality any *other*
+    /// space recorded for them — that is how an image-derived chunk is recognised without its file.
+    private func chunksMissingActiveEmbedding() throws -> [RebuildableChunk] {
+        let statement = try db.prepare("""
+        SELECT chunks.id, chunks.text, (
+          SELECT modality FROM embeddings WHERE embeddings.chunk_id = chunks.id LIMIT 1
+        ) FROM chunks
+        WHERE chunks.active = 1 AND NOT EXISTS (
+          SELECT 1 FROM embeddings
+          WHERE embeddings.chunk_id = chunks.id AND embeddings.embedding_space_id = ?1
+        )
+        ORDER BY chunks.document_id ASC, chunks.ordinal ASC
+        """)
+        statement.bind(1, embeddingSpaceID)
+
+        var chunks: [RebuildableChunk] = []
+        while try statement.step() {
+            guard let id = statement.text(0) else { continue }
+            let recordedModality = statement.text(2)
+            chunks.append(
+                RebuildableChunk(
+                    id: id,
+                    text: statement.text(1) ?? "",
+                    // No recorded modality means nothing was ever embedded for this chunk, which
+                    // only happens for text: image documents write their vector at ingest.
+                    isTextModality: recordedModality == nil
+                        || recordedModality == EmbeddingModality.text.rawValue
+                )
+            )
+        }
+        return chunks
+    }
+
     public func upsert(_ obj: IndexedObject) async throws {
         let normalizedBody = Self.normalizedText(obj.body)
         let policyID = obj.policyID ?? IngestionPolicy.default.id.rawValue
@@ -112,7 +230,11 @@ extension IndexStore {
                 contentHash: representationHash,
                 now: now
             )
-            try self.removeChunkRecords(documentID: obj.id)
+            try self.removeChunkRecords(
+                documentID: obj.id,
+                retaining: Set(chunks.map(\.id)),
+                activeEmbeddingSpaceID: activeEmbeddingSpaceID
+            )
             try self.persistChunks(
                 chunks,
                 documentID: obj.id,
@@ -388,19 +510,48 @@ extension IndexStore {
         try statement.step()
     }
 
-    /// Remove every chunk row for a document together with its FTS, embedding,
-    /// and vector rows. Superseded chunk state is deleted outright: nothing
-    /// reads `active = 0` rows, and keeping them grew the store on every edit.
-    /// Runs inside the caller's transaction, so search never observes the
-    /// document without its replacement chunks.
-    private func removeChunkRecords(documentID: String) throws {
-        let chunkIDs = try allChunkIDs(documentID: documentID)
-        for chunkID in chunkIDs {
+    /// Clears a document's chunk records, with their FTS, embedding, and vector rows, ahead of a
+    /// re-ingest or a delete. Superseded chunk state is deleted outright: nothing reads
+    /// `active = 0` rows, and keeping them grew the store on every edit. Runs inside the caller's
+    /// transaction, so search never observes the document without its replacement chunks.
+    ///
+    /// Chunk IDs hash their occurrence and content, so an ID that appears in both the old and
+    /// new chunk sets denotes the same text at the same position. Those rows are left in place
+    /// for `persistChunks` to update, and only the *active* embedding space is cleared for them —
+    /// another model's vectors for that chunk are still valid and must survive. Chunks that are
+    /// not retained can never be referenced again, so they take every space's embeddings with them.
+    ///
+    /// - Parameters:
+    ///   - retaining: Chunk IDs the caller is about to re-persist. Empty means the document is
+    ///     going away entirely, which clears every chunk in every space.
+    ///   - activeEmbeddingSpaceID: The space being rebuilt. `nil` clears all spaces.
+    private func removeChunkRecords(
+        documentID: String,
+        retaining retainedChunkIDs: Set<String> = [],
+        activeEmbeddingSpaceID: String? = nil
+    ) throws {
+        let existing = try allChunkIDs(documentID: documentID)
+        let obsolete = existing.filter { !retainedChunkIDs.contains($0) }
+        let retained = existing.filter { retainedChunkIDs.contains($0) }
+
+        for chunkID in obsolete {
             try deleteFTSChunk(chunkID: chunkID)
         }
-        try deleteEmbeddingsAndVectors(chunkIDs: chunkIDs)
-        let chunks = try db.prepare("DELETE FROM chunks WHERE document_id = ?1")
+        try deleteEmbeddingsAndVectors(chunkIDs: obsolete, embeddingSpaceID: nil)
+
+        if let activeEmbeddingSpaceID, !retained.isEmpty {
+            try deleteEmbeddingsAndVectors(chunkIDs: retained, embeddingSpaceID: activeEmbeddingSpaceID)
+        }
+
+        guard !obsolete.isEmpty else { return }
+        let chunks = try db.prepare("""
+        DELETE FROM chunks WHERE document_id = ?1
+          AND id IN (\(Self.placeholders(count: obsolete.count, startingAt: 2)))
+        """)
         chunks.bind(1, documentID)
+        for (offset, chunkID) in obsolete.enumerated() {
+            chunks.bind(Int32(offset + 2), chunkID)
+        }
         try chunks.step()
     }
 
@@ -423,12 +574,17 @@ extension IndexStore {
           id,document_id,document_version_id,representation_id,representation_lineage_id,ordinal,
           chunker_id,chunker_version,policy_id,policy_version,text,context_prefix,context_suffix,
           heading_path,byte_start,byte_end,character_start,character_end,token_start,token_end,
-          page_start,page_end,section_label,content_hash,active,availability_state,created_at
-        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,1,?25,?26)
+          page_start,page_end,section_label,content_hash,active,availability_state,created_at,
+          line_start,line_end
+        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,1,?25,?26,?27,?28)
         ON CONFLICT(id) DO UPDATE SET text=excluded.text,
           active=1,
           availability_state=excluded.availability_state,
-          created_at=excluded.created_at
+          created_at=excluded.created_at,
+          context_prefix=excluded.context_prefix,
+          context_suffix=excluded.context_suffix,
+          line_start=excluded.line_start,
+          line_end=excluded.line_end
         """)
         let ftsDelete = try db.prepare("DELETE FROM chunks_fts WHERE chunk_id = ?1")
         let fts = try db.prepare("""
@@ -448,8 +604,10 @@ extension IndexStore {
             statement.bind(9, policyID)
             statement.bind(10, policyVersion)
             statement.bind(11, chunk.text)
-            statement.bind(12, "")
-            statement.bind(13, "")
+            statement.bind(12, chunk.contextPrefix)
+            statement.bind(13, chunk.contextSuffix)
+            // heading_path stays empty until the chunker understands document structure; the
+            // built-in chunker splits on blank lines and knows nothing about headings or symbols.
             statement.bind(14, "")
             statement.bind(15, chunk.byteStart)
             statement.bind(16, chunk.byteEnd)
@@ -463,6 +621,8 @@ extension IndexStore {
             statement.bind(24, chunk.contentHash)
             statement.bind(25, AvailabilityState.chunkTextAvailable.rawValue)
             statement.bind(26, now)
+            statement.bind(27, chunk.lineStart)
+            statement.bind(28, chunk.lineEnd)
             try statement.step()
 
             ftsDelete.reset()
@@ -484,15 +644,24 @@ extension IndexStore {
         activeEmbeddingSpaceID: String,
         now: TimeInterval
     ) throws {
+        // One prepare per statement, reset per embedding — matching the chunk writer above, which
+        // hoisted its prepares for exactly this reason. These two were still re-preparing on every
+        // iteration, so a document's embedding write paid for a full parse per chunk.
+        let record = try db.prepare("""
+        INSERT INTO embeddings(
+          id,chunk_id,embedding_space_id,model_id,model_version,dimension,modality,prompt_kind,
+          vector_backend_id,vector_backend_version,vector_hash,created_at
+        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+        ON CONFLICT(id) DO UPDATE SET vector_hash=excluded.vector_hash,
+          created_at=excluded.created_at
+        """)
+        let vector = try db.prepare("""
+        INSERT INTO vectors(id,dim,vec) VALUES(?1,?2,?3)
+        ON CONFLICT(id) DO UPDATE SET dim=excluded.dim, vec=excluded.vec
+        """)
+
         for embedding in embeddings {
-            let record = try db.prepare("""
-            INSERT INTO embeddings(
-              id,chunk_id,embedding_space_id,model_id,model_version,dimension,modality,prompt_kind,
-              vector_backend_id,vector_backend_version,vector_hash,created_at
-            ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-            ON CONFLICT(id) DO UPDATE SET vector_hash=excluded.vector_hash,
-              created_at=excluded.created_at
-            """)
+            record.reset()
             record.bind(1, embedding.id)
             record.bind(2, embedding.chunkID)
             record.bind(3, activeEmbeddingSpaceID)
@@ -507,10 +676,7 @@ extension IndexStore {
             record.bind(12, now)
             try record.step()
 
-            let vector = try db.prepare("""
-            INSERT INTO vectors(id,dim,vec) VALUES(?1,?2,?3)
-            ON CONFLICT(id) DO UPDATE SET dim=excluded.dim, vec=excluded.vec
-            """)
+            vector.reset()
             vector.bind(1, embedding.id)
             vector.bind(2, dimension)
             vector.bindBlob(3, Vector.toBytes(embedding.vector))
@@ -548,14 +714,24 @@ extension IndexStore {
         return try statement.step()
     }
 
-    private func deleteEmbeddingsAndVectors(chunkIDs: [String]) throws {
+    /// - Parameter embeddingSpaceID: Restricts the delete to one space. `nil` removes the chunk's
+    ///   embeddings in every space, which is only correct when the chunk itself is going away.
+    private func deleteEmbeddingsAndVectors(chunkIDs: [String], embeddingSpaceID: String?) throws {
+        guard !chunkIDs.isEmpty else { return }
+        let spacePredicate = embeddingSpaceID == nil ? "" : " AND embedding_space_id = ?2"
         for chunkID in chunkIDs {
-            let vectors = try db.prepare("DELETE FROM vectors WHERE id IN (SELECT id FROM embeddings WHERE chunk_id = ?1)")
+            let vectors = try db.prepare("""
+            DELETE FROM vectors WHERE id IN (
+              SELECT id FROM embeddings WHERE chunk_id = ?1\(spacePredicate)
+            )
+            """)
             vectors.bind(1, chunkID)
+            if let embeddingSpaceID { vectors.bind(2, embeddingSpaceID) }
             try vectors.step()
 
-            let embeddings = try db.prepare("DELETE FROM embeddings WHERE chunk_id = ?1")
+            let embeddings = try db.prepare("DELETE FROM embeddings WHERE chunk_id = ?1\(spacePredicate)")
             embeddings.bind(1, chunkID)
+            if let embeddingSpaceID { embeddings.bind(2, embeddingSpaceID) }
             try embeddings.step()
         }
     }
@@ -616,7 +792,11 @@ extension IndexStore {
                     characterStart: 0,
                     characterEnd: 0,
                     tokenStart: 0,
-                    tokenEnd: 0
+                    tokenEnd: 0,
+                    lineStart: 1,
+                    lineEnd: 1,
+                    contextPrefix: "",
+                    contextSuffix: ""
                 )
             ]
         }
@@ -633,11 +813,13 @@ extension IndexStore {
         var measuredCharacters = 0
         var measuredBytes = 0
         var measuredTokens = 0
+        var measuredNewlines = 0
         func advanceMeasurements(to index: String.Index) {
             guard index > measuredIndex else { return }
             let segment = text[measuredIndex..<index]
             measuredCharacters += segment.count
             measuredBytes += segment.utf8.count
+            measuredNewlines += segment.lazy.filter(\.isNewline).count
             var segmentTokens = Self.tokenCount(String(segment))
             // The tokenizer splits on non-alphanumerics; a token straddling the
             // previous measurement boundary would be counted by both segments.
@@ -661,6 +843,7 @@ extension IndexStore {
             let occurrence = occurrenceByHash[contentHash, default: 0]
             occurrenceByHash[contentHash] = occurrence + 1
             advanceMeasurements(to: effectiveRange.lowerBound)
+            let lineStart = measuredNewlines + 1
             chunks.append(
                 PreparedChunk(
                     id: Self.chunkID(
@@ -679,7 +862,12 @@ extension IndexStore {
                     characterStart: measuredCharacters,
                     characterEnd: measuredCharacters + effectiveText.count,
                     tokenStart: measuredTokens,
-                    tokenEnd: measuredTokens + Self.tokenCount(effectiveText)
+                    tokenEnd: measuredTokens + Self.tokenCount(effectiveText),
+                    lineStart: lineStart,
+                    // Inclusive: a chunk with no newline occupies exactly its starting line.
+                    lineEnd: lineStart + effectiveText.lazy.filter(\.isNewline).count,
+                    contextPrefix: Self.context(in: text, before: effectiveRange.lowerBound),
+                    contextSuffix: Self.context(in: text, after: effectiveRange.upperBound)
                 )
             )
 
@@ -712,6 +900,24 @@ extension IndexStore {
             current = text.index(after: current)
         }
         return best
+    }
+
+    /// Characters of adjacent text stored on each side of a chunk. Enough to show where a chunk
+    /// sits without materially growing the row: chunks are ~1600 characters, so this is ~15%.
+    private static let contextWindowCharacterLimit = 120
+
+    private static func context(in text: String, before index: String.Index) -> String {
+        guard index > text.startIndex else { return "" }
+        let lower = text.index(index, offsetBy: -contextWindowCharacterLimit, limitedBy: text.startIndex)
+            ?? text.startIndex
+        return String(text[lower..<index])
+    }
+
+    private static func context(in text: String, after index: String.Index) -> String {
+        guard index < text.endIndex else { return "" }
+        let upper = text.index(index, offsetBy: contextWindowCharacterLimit, limitedBy: text.endIndex)
+            ?? text.endIndex
+        return String(text[index..<upper])
     }
 
     private static func trimmedRange(in text: String, range: Range<String.Index>) -> Range<String.Index> {

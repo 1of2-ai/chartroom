@@ -24,7 +24,7 @@ macOS 15+.
 Add the package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/1of2-ai/Chartroom", from: "0.1.1")
+.package(url: "https://github.com/1of2-ai/Chartroom", from: "0.5.1")
 ```
 
 Then depend on the products you need, e.g. `IndexEngine` and `IndexEngineJina`.

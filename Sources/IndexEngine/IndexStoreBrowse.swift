@@ -21,6 +21,35 @@ extension IndexStore {
         )
     }
 
+    /// Which embedding spaces this store actually holds vectors for, against the one the active
+    /// embedder searches.
+    ///
+    /// Every retrieval channel filters on the active `embedding_space_id`, so an embedder whose
+    /// identity has changed — a new model, a new dimension, or for Jina bundles a regenerated
+    /// manifest hash — matches nothing and search goes quiet without erroring. This is derived
+    /// from the stored vectors rather than a recorded marker so it cannot disagree with the data
+    /// it describes.
+    public func embeddingSpaceCoverage() throws -> EmbeddingSpaceCoverage {
+        let statement = try db.prepare("""
+        SELECT embeddings.embedding_space_id, COUNT(*) FROM embeddings
+        JOIN chunks ON chunks.id = embeddings.chunk_id
+        WHERE chunks.active = 1
+        GROUP BY embeddings.embedding_space_id
+        ORDER BY embeddings.embedding_space_id ASC
+        """)
+        var counts: [String: Int] = [:]
+        while try statement.step() {
+            guard let spaceID = statement.text(0) else { continue }
+            counts[spaceID] = statement.int(1)
+        }
+        return EmbeddingSpaceCoverage(
+            activeSpaceID: EngineID(rawValue: embeddingSpaceID),
+            storedSpaces: counts
+                .map { EmbeddingSpaceCoverage.Space(id: EngineID(rawValue: $0.key), embeddingCount: $0.value) }
+                .sorted { $0.id.rawValue < $1.id.rawValue }
+        )
+    }
+
     public func documentSummaries(request: DocumentBrowseRequest) throws -> DocumentBrowseResponse {
         let filter = documentBrowseFilterSQL(request)
         let total = try documentCount(filter: filter)
@@ -209,7 +238,8 @@ extension IndexStore {
         let statement = try db.prepare("""
         SELECT id, ordinal, text, heading_path, byte_start, byte_end,
                character_start, character_end, token_start, token_end, content_hash,
-               EXISTS(SELECT 1 FROM embeddings WHERE embeddings.chunk_id = chunks.id) AS has_embedding
+               EXISTS(SELECT 1 FROM embeddings WHERE embeddings.chunk_id = chunks.id) AS has_embedding,
+               line_start, line_end, context_prefix, context_suffix
         FROM chunks
         WHERE document_id = ?1 AND active = 1
         ORDER BY ordinal ASC
@@ -230,6 +260,10 @@ extension IndexStore {
                     characterEnd: statement.int(7),
                     tokenStart: statement.int(8),
                     tokenEnd: statement.int(9),
+                    lineStart: statement.optionalInt(12),
+                    lineEnd: statement.optionalInt(13),
+                    contextPrefix: statement.text(14) ?? "",
+                    contextSuffix: statement.text(15) ?? "",
                     contentHash: statement.text(10) ?? "",
                     hasEmbedding: statement.int(11) != 0
                 )
