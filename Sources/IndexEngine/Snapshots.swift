@@ -117,6 +117,13 @@ public struct ChunkSummary: Codable, Hashable, Sendable, Identifiable {
     public var characterEnd: Int
     public var tokenStart: Int
     public var tokenEnd: Int
+    /// 1-based inclusive line range in the document. `nil` for chunks written before line
+    /// tracking existed — re-ingesting the document fills them.
+    public var lineStart: Int?
+    public var lineEnd: Int?
+    /// Text immediately before and after the chunk, so a caller can see where the window sits.
+    public var contextPrefix: String
+    public var contextSuffix: String
     public var contentHash: String
     public var hasEmbedding: Bool
 
@@ -132,6 +139,10 @@ public struct ChunkSummary: Codable, Hashable, Sendable, Identifiable {
         characterEnd: Int,
         tokenStart: Int,
         tokenEnd: Int,
+        lineStart: Int? = nil,
+        lineEnd: Int? = nil,
+        contextPrefix: String = "",
+        contextSuffix: String = "",
         contentHash: String,
         hasEmbedding: Bool
     ) {
@@ -146,6 +157,10 @@ public struct ChunkSummary: Codable, Hashable, Sendable, Identifiable {
         self.characterEnd = characterEnd
         self.tokenStart = tokenStart
         self.tokenEnd = tokenEnd
+        self.lineStart = lineStart
+        self.lineEnd = lineEnd
+        self.contextPrefix = contextPrefix
+        self.contextSuffix = contextSuffix
         self.contentHash = contentHash
         self.hasEmbedding = hasEmbedding
     }
@@ -164,6 +179,11 @@ public struct IndexEngineSnapshot: Codable, Sendable, Equatable {
     public var modelID: String
     public var embeddingDimension: Int
     public var embeddingSpaceID: EmbeddingSpaceID
+    /// Which spaces the store's vectors actually live in. `embeddingCount` above counts only the
+    /// active space, so an index that is fully populated but unreadable by the current embedder
+    /// reports zero there and looks identical to an empty one — this is what tells them apart.
+    /// Optional so older diagnostics JSON without the field still decodes.
+    public var embeddingSpaceCoverage: EmbeddingSpaceCoverage?
     public var lastIngestedAt: Date?
     public var policyStates: [PolicyResolution]
 
@@ -177,6 +197,7 @@ public struct IndexEngineSnapshot: Codable, Sendable, Equatable {
         modelID: String,
         embeddingDimension: Int,
         embeddingSpaceID: EmbeddingSpaceID,
+        embeddingSpaceCoverage: EmbeddingSpaceCoverage? = nil,
         lastIngestedAt: Date?,
         policyStates: [PolicyResolution]
     ) {
@@ -189,6 +210,7 @@ public struct IndexEngineSnapshot: Codable, Sendable, Equatable {
         self.modelID = modelID
         self.embeddingDimension = embeddingDimension
         self.embeddingSpaceID = embeddingSpaceID
+        self.embeddingSpaceCoverage = embeddingSpaceCoverage
         self.lastIngestedAt = lastIngestedAt
         self.policyStates = policyStates
     }
@@ -250,6 +272,8 @@ public struct DeletionSummary: Sendable, Equatable {
 public struct SearchResponse: Codable, Sendable, Equatable {
     public var query: String
     public var mode: RetrievalMode
+    /// Every retrieved result, ranked, including the weak tail. Most callers want
+    /// `strongResults` — see below for why the two are separated here rather than per client.
     public var results: [SearchResultSnapshot]
     public var diagnostics: SearchDiagnostics
 
@@ -264,6 +288,22 @@ public struct SearchResponse: Codable, Sendable, Equatable {
         self.results = results
         self.diagnostics = diagnostics
     }
+
+    /// Results with real evidence behind them.
+    ///
+    /// Vector search returns its top-N by cosine unconditionally, so `results` always contains a
+    /// tail whether or not anything matched. The split is defined here, once, because every
+    /// consumer needs the same rule: the GUI, the workspace merge, and the agent tool surface each
+    /// have to distinguish "here are your answers" from "nothing matched", and three
+    /// implementations of that would be three chances to disagree.
+    public var strongResults: [SearchResultSnapshot] {
+        results.filter { !$0.isWeak }
+    }
+
+    /// The below-threshold tail. Offer it deliberately; never as the answer.
+    public var weakResults: [SearchResultSnapshot] {
+        results.filter(\.isWeak)
+    }
 }
 
 public struct SearchResultSnapshot: Codable, Hashable, Sendable {
@@ -275,8 +315,21 @@ public struct SearchResultSnapshot: Codable, Hashable, Sendable {
     public var snippet: String?
     public var sourceURI: URL?
     public var contentType: String
+    /// Fusion score — ordering only. See `similarity` for how good the match actually is.
     public var score: Double
     public var rank: Int
+    /// Cosine similarity to the query, when the vector channel produced this result.
+    /// `nil` means the result arrived by title or keyword match, where `diagnostics.keywordScore`
+    /// carries the signal instead.
+    public var similarity: Double?
+    /// Vector-only evidence below the embedder's threshold: tail, not an answer. Clients should
+    /// exclude these from the primary result set rather than each inventing a floor.
+    public var isWeak: Bool
+    /// 1-based inclusive line range of the matching chunk within the document. This is the unit a
+    /// consumer acts on — an editor jump, a file read, an edit — so a path plus a snippet without
+    /// it forces the whole file to be re-read. `nil` when the chunk predates line tracking.
+    public var lineStart: Int?
+    public var lineEnd: Int?
     public var diagnostics: SearchResultDiagnostics
     public var provenance: ResultProvenance
 
@@ -291,6 +344,10 @@ public struct SearchResultSnapshot: Codable, Hashable, Sendable {
         contentType: String,
         score: Double,
         rank: Int,
+        similarity: Double? = nil,
+        isWeak: Bool = false,
+        lineStart: Int? = nil,
+        lineEnd: Int? = nil,
         diagnostics: SearchResultDiagnostics,
         provenance: ResultProvenance
     ) {
@@ -304,14 +361,66 @@ public struct SearchResultSnapshot: Codable, Hashable, Sendable {
         self.contentType = contentType
         self.score = score
         self.rank = rank
+        self.similarity = similarity
+        self.isWeak = isWeak
+        self.lineStart = lineStart
+        self.lineEnd = lineEnd
         self.diagnostics = diagnostics
         self.provenance = provenance
+    }
+}
+
+/// The embedding spaces a store holds vectors in, against the space the active embedder reads.
+///
+/// A store whose vectors all sit in some *other* space is not empty and not broken — it is
+/// unreadable by the current model, which is a different problem with a different remedy
+/// (re-index, or restore the previous embedder).
+public struct EmbeddingSpaceCoverage: Codable, Hashable, Sendable {
+    public struct Space: Codable, Hashable, Sendable {
+        public var id: EmbeddingSpaceID
+        public var embeddingCount: Int
+
+        public init(id: EmbeddingSpaceID, embeddingCount: Int) {
+            self.id = id
+            self.embeddingCount = embeddingCount
+        }
+    }
+
+    public var activeSpaceID: EmbeddingSpaceID
+    public var storedSpaces: [Space]
+
+    public init(activeSpaceID: EmbeddingSpaceID, storedSpaces: [Space] = []) {
+        self.activeSpaceID = activeSpaceID
+        self.storedSpaces = storedSpaces
+    }
+
+    public var activeSpaceEmbeddingCount: Int {
+        storedSpaces.first { $0.id == activeSpaceID }?.embeddingCount ?? 0
+    }
+
+    public var totalEmbeddingCount: Int {
+        storedSpaces.reduce(0) { $0 + $1.embeddingCount }
+    }
+
+    /// The store holds vectors, but none the active embedder can read. Vector retrieval is
+    /// silently blind until the index is rebuilt or the previous embedder is restored.
+    public var isOrphaned: Bool {
+        activeSpaceEmbeddingCount == 0 && totalEmbeddingCount > 0
+    }
+
+    /// Vectors exist in a space the active embedder cannot read, alongside ones it can.
+    public var hasUnreadableVectors: Bool {
+        totalEmbeddingCount > activeSpaceEmbeddingCount
     }
 }
 
 public struct SearchDiagnostics: Codable, Hashable, Sendable {
     public var degraded: Bool
     public var missingChannels: [RetrievalChannel]
+    /// The index holds vectors, but none in the embedder's space. Vector retrieval contributed
+    /// nothing and no error was raised — without this flag the result is indistinguishable from
+    /// an honestly empty index.
+    public var embeddingSpaceMismatch: Bool
     public var sqlFilterLatency: TimeInterval?
     public var ftsLatency: TimeInterval?
     public var vectorLatency: TimeInterval?
@@ -322,6 +431,7 @@ public struct SearchDiagnostics: Codable, Hashable, Sendable {
     public init(
         degraded: Bool = false,
         missingChannels: [RetrievalChannel] = [],
+        embeddingSpaceMismatch: Bool = false,
         sqlFilterLatency: TimeInterval? = nil,
         ftsLatency: TimeInterval? = nil,
         vectorLatency: TimeInterval? = nil,
@@ -331,6 +441,7 @@ public struct SearchDiagnostics: Codable, Hashable, Sendable {
     ) {
         self.degraded = degraded
         self.missingChannels = missingChannels
+        self.embeddingSpaceMismatch = embeddingSpaceMismatch
         self.sqlFilterLatency = sqlFilterLatency
         self.ftsLatency = ftsLatency
         self.vectorLatency = vectorLatency
@@ -353,6 +464,8 @@ public struct SearchResultDiagnostics: Codable, Hashable, Sendable {
     public var ftsRank: Int?
     public var vectorRank: Int?
     public var exactRank: Int?
+    /// BM25 relevance from the keyword channel, negated so larger is better.
+    public var keywordScore: Double?
     public var graphReason: String?
     public var appliedBoosts: [AppliedBoost]
 
@@ -360,12 +473,14 @@ public struct SearchResultDiagnostics: Codable, Hashable, Sendable {
         ftsRank: Int? = nil,
         vectorRank: Int? = nil,
         exactRank: Int? = nil,
+        keywordScore: Double? = nil,
         graphReason: String? = nil,
         appliedBoosts: [AppliedBoost] = []
     ) {
         self.ftsRank = ftsRank
         self.vectorRank = vectorRank
         self.exactRank = exactRank
+        self.keywordScore = keywordScore
         self.graphReason = graphReason
         self.appliedBoosts = appliedBoosts
     }
@@ -612,7 +727,20 @@ public struct ModelStatusSnapshot: Codable, Hashable, Sendable {
     public var modelID: String
     public var embeddingSpaceID: EmbeddingSpaceID?
     public var dimension: Int
+
+    /// The provider answered a probe with a correctly shaped vector.
+    ///
+    /// Availability is not the same claim as semantic retrieval: a hashing stand-in is perfectly
+    /// available and has no semantic channel at all. Read this together with `isModelBacked`.
     public var isAvailable: Bool
+
+    /// The vectors come from a real embedding model rather than a stand-in.
+    ///
+    /// Carried separately and without a default so a fallback cannot present itself as the real
+    /// thing. Hosts that show only `isAvailable` will report a hashing fallback as a healthy
+    /// model, which is precisely the state this field exists to make visible.
+    public var isModelBacked: Bool
+
     public var message: String
 
     public init(
@@ -620,12 +748,14 @@ public struct ModelStatusSnapshot: Codable, Hashable, Sendable {
         embeddingSpaceID: EmbeddingSpaceID?,
         dimension: Int,
         isAvailable: Bool,
+        isModelBacked: Bool,
         message: String = ""
     ) {
         self.modelID = modelID
         self.embeddingSpaceID = embeddingSpaceID
         self.dimension = dimension
         self.isAvailable = isAvailable
+        self.isModelBacked = isModelBacked
         self.message = message
     }
 }

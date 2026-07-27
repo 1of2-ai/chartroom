@@ -19,6 +19,8 @@ public final class JinaTextEmbeddingProvider: Embedder, @unchecked Sendable {
     public let modelID: String
     public let dimension: Int
     public let embeddingSpaceID: String
+    public let isModelBacked = true
+    public var weakSimilarityThreshold: Float { JinaSimilarity.weakThreshold }
 
     private let textEmbedder: JinaTextEmbedder
     private let queue = DispatchQueue(label: "indexengine.jina.text", qos: .userInitiated)

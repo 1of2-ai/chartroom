@@ -16,6 +16,30 @@ public protocol Embedder: Sendable {
     var modelID: String { get }
     var dimension: Int { get }
     var embeddingSpaceID: String { get }
+
+    /// Whether these vectors come from a real embedding model, or from a stand-in that only
+    /// produces something vector-shaped.
+    ///
+    /// Deliberately has no default. A fallback embedder that inherited `true` is exactly the
+    /// failure this exists to prevent: hashing-backed retrieval reported to the user as
+    /// model-backed semantic search, indistinguishable in status from the real thing. Every
+    /// conformance states which it is, and the compiler enforces that it states something.
+    var isModelBacked: Bool { get }
+
+    /// Cosine similarity below which a vector hit carries no retrieval signal.
+    ///
+    /// Vector search always returns its top-N by cosine, so a query that matches nothing
+    /// still comes back full — the rank is real, the relevance is not. Retrieval marks a
+    /// hit weak when its *only* evidence is a similarity under this value, which is what
+    /// lets every client apply one relevance rule instead of inventing its own.
+    ///
+    /// The right value is a property of the model's similarity distribution, so it also has no
+    /// default. It previously defaulted to a near-orthogonal 0.15, and every real model then
+    /// inherited it: dense transformer encoders put unrelated text far above that, so the weak
+    /// partition admitted noise as answers and the guard was inert exactly where it mattered. A
+    /// conformance must state a value it has measured for its own model.
+    var weakSimilarityThreshold: Float { get }
+
     func embed(_ text: String, kind: EmbedKind) async throws -> [Float]
 
     /// Embed many texts at once. Batch-capable backends (Jina) group these by sequence-length
@@ -72,6 +96,15 @@ public enum EmbedderModalityError: Error, CustomStringConvertible {
 public struct HashingEmbedder: Embedder {
     public let modelID: String
     public let dimension: Int
+
+    /// Not a model. Token hashing produces lexical overlap in vector clothing, so an index using
+    /// this has no semantic channel at all — three lexical channels wearing the name of a hybrid.
+    public let isModelBacked = false
+
+    /// Exact-token overlap of an L2-normalized bag of words. Unrelated text shares no token bucket
+    /// and scores at or near zero, so this cuts the genuinely orthogonal without discarding the
+    /// partial-overlap matches the mock exists to demonstrate.
+    public let weakSimilarityThreshold: Float = 0.15
 
     public init(modelID: String = "hashing-mock-v1", dimension: Int = 1024) {
         self.modelID = modelID

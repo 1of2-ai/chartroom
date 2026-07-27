@@ -349,10 +349,15 @@ public actor IndexEngine: IndexEngineClient {
                 contentType: hit.type,
                 score: hit.score,
                 rank: 0,
+                similarity: hit.similarity,
+                isWeak: hit.isWeak,
+                lineStart: hit.lineStart,
+                lineEnd: hit.lineEnd,
                 diagnostics: SearchResultDiagnostics(
                     ftsRank: hit.keywordRank,
                     vectorRank: hit.vectorRank,
                     exactRank: hit.exactRank,
+                    keywordScore: hit.keywordScore,
                     graphReason: nil,
                     appliedBoosts: []
                 ),
@@ -474,15 +479,74 @@ public actor IndexEngine: IndexEngineClient {
         return Self.mergedJobs(durableJobs, recentJobs: recentJobs, limit: limit)
     }
 
+    /// Report the embedding provider's health *and* what kind of provider it is.
+    ///
+    /// A hashing fallback probes as perfectly available, so availability alone told hosts that
+    /// semantic retrieval was working when the index had no semantic channel at all. The message
+    /// leads with the degradation whenever the provider is not model-backed, because a host that
+    /// renders only the message must still convey it.
     public func modelStatus() async -> ModelStatusSnapshot {
         let status = await store.embeddingProviderStatus()
+        let isModelBacked = store.isModelBacked
+        let message: String
+        if !isModelBacked {
+            message = """
+            Not model-backed: '\(store.modelID)' produces vector-shaped output without semantic \
+            meaning, so retrieval is lexical only. \(status.message)
+            """
+        } else {
+            message = status.message
+        }
         return ModelStatusSnapshot(
             modelID: store.modelID,
             embeddingSpaceID: EngineID(rawValue: store.embeddingSpaceID),
             dimension: store.dimension,
             isAvailable: status.isAvailable,
-            message: status.message
+            isModelBacked: isModelBacked,
+            message: message
         )
+    }
+
+    public func rebuildEmbeddings() async throws -> EmbeddingRebuildSummary {
+        do {
+            return try await store.rebuildActiveEmbeddingSpace()
+        } catch {
+            throw rebuildError(error)
+        }
+    }
+
+    /// A rebuild fails for the same underlying reasons as a search, but on the *document* side of
+    /// the embedder. Reusing the search messages here would report a failed query vector for what
+    /// is actually a failed document embedding.
+    private func rebuildError(_ error: Error) -> IndexEngineError {
+        switch error {
+        case let engineError as IndexEngineError:
+            return engineError
+        case let storeError as IndexStoreError:
+            return IndexEngineError(
+                .embeddingSpaceUnavailable,
+                code: "index.rebuild.embedding-space-mismatch",
+                recoverability: .needsConfiguration,
+                summary: "The rebuilt vectors do not match the store's embedding dimension.",
+                detail: String(describing: storeError)
+            )
+        case let storageError as SQLiteError:
+            return IndexEngineError(
+                .storageUnavailable,
+                code: "index.rebuild.storage-unavailable",
+                recoverability: .retryable,
+                summary: "The index store could not write the rebuilt embeddings.",
+                detail: String(describing: storageError)
+            )
+        default:
+            return IndexEngineError(
+                .embeddingProviderUnavailable,
+                code: "index.rebuild.embedding-unavailable",
+                recoverability: .needsConfiguration,
+                summary: "The embedding provider could not embed the stored content.",
+                detail: String(describing: error)
+            )
+        }
     }
 
     public func snapshot() async -> IndexEngineSnapshot {
@@ -507,6 +571,7 @@ public actor IndexEngine: IndexEngineClient {
             modelID: store.modelID,
             embeddingDimension: store.dimension,
             embeddingSpaceID: EngineID(rawValue: store.embeddingSpaceID),
+            embeddingSpaceCoverage: try? await store.embeddingSpaceCoverage(),
             lastIngestedAt: lastIngestedAt,
             policyStates: configuration.registry.policyStates
         )

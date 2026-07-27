@@ -445,6 +445,10 @@ private actor ScriptedEngine: IndexEngineClient {
         DocumentBrowseResponse(request: request, documents: [], totalMatching: 0)
     }
 
+    func rebuildEmbeddings() async throws -> EmbeddingRebuildSummary {
+        EmbeddingRebuildSummary()
+    }
+
     func health() async -> IndexHealthSnapshot {
         IndexHealthSnapshot(objectCount: 0, policyStates: [])
     }
@@ -458,7 +462,7 @@ private actor ScriptedEngine: IndexEngineClient {
     }
 
     func modelStatus() async -> ModelStatusSnapshot {
-        ModelStatusSnapshot(modelID: "scripted", embeddingSpaceID: nil, dimension: 0, isAvailable: true)
+        ModelStatusSnapshot(modelID: "scripted", embeddingSpaceID: nil, dimension: 0, isAvailable: true, isModelBacked: false)
     }
 
     func snapshot() async -> IndexEngineSnapshot {

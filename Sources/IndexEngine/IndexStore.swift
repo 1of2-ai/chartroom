@@ -67,10 +67,29 @@ public struct SearchHit: Sendable, Equatable {
     public var policyID: String?
     public var representationID: String?
     public var embeddingSpaceID: String?
+    /// Reciprocal Rank Fusion score. A function of *position* in each channel, not of match
+    /// quality — every hit earns one whether or not anything matched. Order results by this;
+    /// never present it as relevance. `similarity` is the absolute signal.
     public var score: Double
     public var exactRank: Int?
     public var keywordRank: Int?
     public var vectorRank: Int?
+    /// Cosine similarity to the query in the active embedding space, when the vector channel
+    /// produced this chunk. `nil` when the chunk reached the result set by title or keyword
+    /// match alone, or when the vector channel was skipped or unavailable.
+    public var similarity: Double?
+    /// BM25 relevance from FTS5, when the keyword channel produced this chunk. SQLite reports
+    /// BM25 with lower being better; this is negated so that larger is better, matching
+    /// `similarity` and removing the trap of comparing the two in opposite directions.
+    public var keywordScore: Double?
+    /// The chunk's only evidence is a vector similarity below the embedder's threshold — it is
+    /// tail, not an answer. Computed engine-side so the app and the MCP surface cannot drift
+    /// into two different definitions of "no results".
+    public var isWeak: Bool
+    /// 1-based inclusive line range of the matching chunk. `nil` for chunks indexed before line
+    /// tracking existed; re-ingesting the document fills them.
+    public var lineStart: Int?
+    public var lineEnd: Int?
 }
 
 public struct IndexStoreCounts: Sendable, Equatable {
@@ -110,6 +129,9 @@ public actor IndexStore {
     public let modelID: String
     public let dimension: Int
     public let embeddingSpaceID: String
+    /// Whether this store's vectors come from a real model. Captured at open beside the other
+    /// embedder identity, so status reads it without reaching back through the actor.
+    public let isModelBacked: Bool
     public let vectorBackendID = EngineID.builtInSQLiteVectorBackend.rawValue
     public let vectorBackendVersion = "1"
 
@@ -129,6 +151,7 @@ public actor IndexStore {
         self.modelID = embedder.modelID
         self.dimension = embedder.dimension
         self.embeddingSpaceID = embedder.embeddingSpaceID
+        self.isModelBacked = embedder.isModelBacked
         try Self.installSchema(
             db: db,
             vectorBackendID: vectorBackendID,
@@ -151,6 +174,13 @@ public actor IndexStore {
 
     static func placeholders(count: Int) -> String {
         Array(repeating: "?", count: count).joined(separator: ",")
+    }
+
+    /// Numbered placeholders (`?2,?3,…`) for statements that already bind by index. Mixing
+    /// anonymous `?` with numbered parameters in one statement makes the numbering implicit;
+    /// this keeps it stated.
+    static func placeholders(count: Int, startingAt first: Int) -> String {
+        (0..<count).map { "?\(first + $0)" }.joined(separator: ",")
     }
 
     static func likePattern(for query: String) -> String {

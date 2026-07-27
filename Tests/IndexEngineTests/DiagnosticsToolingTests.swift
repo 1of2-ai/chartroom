@@ -79,7 +79,7 @@ struct DiagnosticsBundleTests {
                 policyStates: []
             ),
             health: IndexHealthSnapshot(objectCount: 2, policyStates: []),
-            modelStatus: ModelStatusSnapshot(modelID: "test", embeddingSpaceID: nil, dimension: 0, isAvailable: true),
+            modelStatus: ModelStatusSnapshot(modelID: "test", embeddingSpaceID: nil, dimension: 0, isAvailable: true, isModelBacked: false),
             jobs: [],
             failures: [],
             lastSearch: SearchResponse(query: "q", mode: .fast, results: [], diagnostics: SearchDiagnostics())
@@ -128,6 +128,10 @@ private actor BenchmarkScriptedEngine: IndexEngineClient {
         DocumentBrowseResponse(request: request, documents: [], totalMatching: 0)
     }
 
+    func rebuildEmbeddings() async throws -> EmbeddingRebuildSummary {
+        EmbeddingRebuildSummary()
+    }
+
     func health() async -> IndexHealthSnapshot {
         IndexHealthSnapshot(objectCount: 0, policyStates: [])
     }
@@ -141,7 +145,7 @@ private actor BenchmarkScriptedEngine: IndexEngineClient {
     }
 
     func modelStatus() async -> ModelStatusSnapshot {
-        ModelStatusSnapshot(modelID: "benchmark", embeddingSpaceID: nil, dimension: 0, isAvailable: true)
+        ModelStatusSnapshot(modelID: "benchmark", embeddingSpaceID: nil, dimension: 0, isAvailable: true, isModelBacked: false)
     }
 
     func snapshot() async -> IndexEngineSnapshot {

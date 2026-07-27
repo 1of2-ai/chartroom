@@ -1,3 +1,4 @@
+import ChartroomTestSupport
 import Foundation
 import Testing
 @testable import IndexEngine
@@ -396,7 +397,10 @@ struct IndexStoreTests {
         #expect(counts.documentCount == 41)
     }
 
-    @Test("object projection no longer dual-writes unused legacy FTS rows")
+    /// The legacy FTS twin is no longer created at all. Asserting it holds no rows was the weaker
+    /// claim available while the table still existed; now the table's absence is the guarantee, and
+    /// a reintroduced dual-write would fail at the write rather than in a row count.
+    @Test("the legacy object FTS twin is not created")
     func objectProjectionDoesNotMaintainLegacyFTS() async throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("legacy-objects-fts-\(UUID().uuidString).sqlite")
@@ -406,7 +410,8 @@ struct IndexStoreTests {
         let store = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 64))
         try await store.upsert(.init(id: "doc", type: "note", title: "Doc", body: "legacy object fts marker"))
         #expect(try Self.rawCount(path: path, table: "objects") == 1)
-        #expect(try Self.rawCount(path: path, table: "objects_fts") == 0)
+        #expect(try Self.tableExists(path: path, table: "objects_fts") == false)
+        #expect(try Self.tableExists(path: path, table: "search_diagnostics") == false)
     }
 
     @Test("chunk metadata stores byte ranges and token offsets, not character placeholders")
@@ -570,6 +575,13 @@ struct IndexStoreTests {
         return try statement.step() ? statement.int(0) : 0
     }
 
+    private static func tableExists(path: String, table: String) throws -> Bool {
+        let db = try SQLite(path: path)
+        let statement = try db.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1")
+        statement.bind(1, table)
+        return try statement.step() && statement.int(0) > 0
+    }
+
     private static func rawDistinctCount(path: String, table: String, column: String) throws -> Int {
         let db = try SQLite(path: path)
         let statement = try db.prepare("SELECT COUNT(DISTINCT \(column)) FROM \(table)")
@@ -610,7 +622,7 @@ private struct ChunkOffsetRow {
     var tokenEnd: Int
 }
 
-private struct WrongDimensionEmbedder: Embedder {
+private struct WrongDimensionEmbedder: FixtureEmbedder {
     var modelID = "wrong-dimension"
     var dimension: Int
     var actualCount: Int
@@ -620,7 +632,7 @@ private struct WrongDimensionEmbedder: Embedder {
     }
 }
 
-private struct WrongQueryDimensionEmbedder: Embedder {
+private struct WrongQueryDimensionEmbedder: FixtureEmbedder {
     var modelID = "wrong-query-dimension"
     var dimension = 8
 
@@ -649,7 +661,7 @@ private actor UpsertRaceGate {
     }
 }
 
-private struct GatedRaceEmbedder: Embedder {
+private struct GatedRaceEmbedder: FixtureEmbedder {
     let modelID = "race-fixture"
     let dimension = 4
     let gate: UpsertRaceGate
@@ -671,7 +683,7 @@ private actor ImageEmbedRecorder {
     }
 }
 
-private struct ImageFixtureEmbedder: Embedder {
+private struct ImageFixtureEmbedder: FixtureEmbedder {
     let modelID = "image-fixture"
     let dimension = 4
     let recorder: ImageEmbedRecorder

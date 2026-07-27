@@ -17,6 +17,8 @@ public final class JinaOmniEmbeddingProvider: Embedder, @unchecked Sendable {
     public let dimension: Int
     public let embeddingSpaceID: String
     public var supportsImageEmbedding: Bool { true }
+    public let isModelBacked = true
+    public var weakSimilarityThreshold: Float { JinaSimilarity.weakThreshold }
 
     private let omni: JinaOmniEmbedder
     private let textEmbedder: JinaTextEmbedder
