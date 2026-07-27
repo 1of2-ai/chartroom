@@ -217,7 +217,7 @@ struct IndexEngineJinaTests {
         let imageURL = try Self.makePNG(red: 0.1, green: 0.2, blue: 0.9)
         defer { try? FileManager.default.removeItem(at: imageURL) }
 
-        _ = try await engine.ingest(IngestRequest(payloads: [
+        let ingestSummary = try await engine.ingest(IngestRequest(payloads: [
             SourcePayload(
                 documentID: "img-1",
                 sourceURI: imageURL,
@@ -226,6 +226,13 @@ struct IndexEngineJinaTests {
                 body: .binaryReference(imageURL)
             )
         ]))
+        // Ingestion failures were previously invisible here: the summary was discarded, so a
+        // failed embed surfaced only as a confusing zero count further down.
+        #expect(
+            ingestSummary.failedCount == 0,
+            "ingest failed: \(ingestSummary.failures.map { "\($0.category): \($0.message) — \($0.detail)" })"
+        )
+        #expect(ingestSummary.acceptedCount == 1)
 
         // The image was embedded by its pixels (the vector channel), not its filename: a
         // text query lands in the same space and retrieves it without sharing any words.

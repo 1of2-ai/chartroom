@@ -78,6 +78,17 @@ public actor ChartroomSession {
         }
     }
 
+    /// Releases the current engine instance. The next `open()` rebuilds it through this
+    /// session's factory, which lets a host apply a changed model configuration without
+    /// constructing an engine outside the product command surface.
+    public func close() {
+        engine = nil
+        storeURL = nil
+        lastSearch = nil
+        lastError = nil
+        state = .unopened
+    }
+
     public func status(limit: Int = 1_000) async -> ChartroomStatus {
         guard let engine else {
             return ChartroomStatus(state: state, storeURL: storeURL, lastError: lastError)
@@ -113,12 +124,53 @@ public actor ChartroomSession {
         _ rootURL: URL,
         connectorID: ConnectorID = "local-files",
         cursorKey: String? = nil,
-        options: LocalFileConnectorOptions = .init()
+        options: LocalFileConnectorOptions = .init(),
+        control: SyncControl? = nil,
+        onProgress: SyncOrchestrator.ProgressHandler? = nil
     ) async throws -> SyncOutcome {
         let connector = LocalFileConnector(rootURL: rootURL, id: connectorID, options: options)
         let effectiveCursorKey = cursorKey ?? "\(connector.id.rawValue)|\(rootURL.standardizedFileURL.path)"
+        return try await sync(
+            connector: connector,
+            cursorKey: effectiveCursorKey,
+            control: control,
+            onProgress: onProgress
+        )
+    }
+
+    /// Runs a connector through Chartroom's cursor and ingestion policy. Hosts provide
+    /// sources and presentation only; event ordering, cursor advancement, and cancellation
+    /// remain owned by the core library.
+    public func sync(
+        connector: any SourceConnector,
+        cursorKey: String,
+        control: SyncControl? = nil,
+        onProgress: SyncOrchestrator.ProgressHandler? = nil
+    ) async throws -> SyncOutcome {
         let orchestrator = SyncOrchestrator(engine: try requiredEngine(), cursorStore: cursorStore)
-        return try await orchestrator.sync(connector: connector, cursorKey: effectiveCursorKey)
+        return try await orchestrator.sync(
+            connector: connector,
+            cursorKey: cursorKey,
+            control: control,
+            onProgress: onProgress
+        )
+    }
+
+    /// Re-ingests explicitly supplied payloads while preserving the same cancellation and
+    /// progress semantics as connector-based work. This is used for targeted retries after
+    /// a recorded local-file failure.
+    public func ingest(
+        payloads: [SourcePayload],
+        control: SyncControl? = nil,
+        onProgress: SyncOrchestrator.ProgressHandler? = nil
+    ) async throws -> IngestOutcome {
+        let orchestrator = SyncOrchestrator(engine: try requiredEngine(), cursorStore: cursorStore)
+        return await orchestrator.ingest(payloads: payloads, control: control, onProgress: onProgress)
+    }
+
+    /// Re-embeds stored content the active model cannot read. See `IndexEngineClient.rebuildEmbeddings`.
+    public func rebuildEmbeddings() async throws -> EmbeddingRebuildSummary {
+        try await requiredEngine().rebuildEmbeddings()
     }
 
     public func deleteDocuments(_ documentIDs: [DocumentID]) async throws -> DeletionSummary {
