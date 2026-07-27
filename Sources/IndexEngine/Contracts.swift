@@ -55,6 +55,10 @@ public protocol IndexEngineClient: Sendable {
     func modelStatus() async -> ModelStatusSnapshot
     func snapshot() async -> IndexEngineSnapshot
 
+    /// Re-embed content the active embedder cannot read, restoring an index orphaned by a model
+    /// change. Rebuilds from stored chunk text, so it needs no access to the original sources.
+    func rebuildEmbeddings() async throws -> EmbeddingRebuildSummary
+
     /// Clear recorded failure diagnostics. `ids == nil` clears them all; otherwise only the
     /// listed ones. Failures are diagnostics, so this never affects indexed content.
     func clearFailures(ids: Set<EngineID>?) async throws
@@ -508,19 +512,26 @@ public struct SearchRequest: Sendable, Equatable {
     }
 }
 
-public enum RetrievalMode: String, Codable, Hashable, Sendable {
+/// `CaseIterable` so surfaces that must publish the valid values — the MCP tool schema, for one —
+/// derive them here instead of maintaining a hand-written copy that can fall out of step.
+public enum RetrievalMode: String, Codable, Hashable, Sendable, CaseIterable {
     case fast
     case quality
     case diagnostic
 }
 
+/// Per-mode candidate budgets for the retrieval channels.
+///
+/// Every field here has to correspond to a stage that actually runs. An earlier
+/// `maxRerankCandidates` did not: no reranker exists in the pipeline, and the value was clamped
+/// to be unreachable at the one place it was read, so it described a stage `RetrievalPipelineDescriptor`
+/// correctly never listed. It was removed rather than given a plausible-looking implementation.
 public struct RetrievalProfile: Codable, Hashable, Sendable {
     public static let fast = RetrievalProfile(
         id: "fast",
         version: 1,
         maxFTSCandidates: 160,
         maxVectorCandidates: 160,
-        maxRerankCandidates: 240,
         maxSnippets: 80
     )
     public static let quality = RetrievalProfile(
@@ -528,7 +539,6 @@ public struct RetrievalProfile: Codable, Hashable, Sendable {
         version: 1,
         maxFTSCandidates: 800,
         maxVectorCandidates: 800,
-        maxRerankCandidates: 1_000,
         maxSnippets: 160
     )
     public static let diagnostic = RetrievalProfile(
@@ -536,7 +546,6 @@ public struct RetrievalProfile: Codable, Hashable, Sendable {
         version: 1,
         maxFTSCandidates: 1_000,
         maxVectorCandidates: 1_000,
-        maxRerankCandidates: 1_000,
         maxSnippets: 200
     )
 
@@ -544,7 +553,6 @@ public struct RetrievalProfile: Codable, Hashable, Sendable {
     public var version: Int
     public var maxFTSCandidates: Int
     public var maxVectorCandidates: Int
-    public var maxRerankCandidates: Int
     public var maxSnippets: Int
 
     public init(
@@ -552,14 +560,12 @@ public struct RetrievalProfile: Codable, Hashable, Sendable {
         version: Int,
         maxFTSCandidates: Int = 500,
         maxVectorCandidates: Int = 500,
-        maxRerankCandidates: Int = 500,
         maxSnippets: Int = 100
     ) {
         self.id = id
         self.version = version
         self.maxFTSCandidates = maxFTSCandidates
         self.maxVectorCandidates = maxVectorCandidates
-        self.maxRerankCandidates = maxRerankCandidates
         self.maxSnippets = maxSnippets
     }
 
@@ -579,15 +585,14 @@ public struct RetrievalProfile: Codable, Hashable, Sendable {
         }
     }
 
-    func normalized(returnLimit: Int) -> RetrievalProfile {
+    /// Clamps the budgets to non-negative. A budget of zero disables that channel and stays
+    /// zero: callers use it to switch a channel off, so nothing here may raise it to meet a
+    /// return limit.
+    func normalized() -> RetrievalProfile {
         var copy = self
         copy.maxFTSCandidates = max(0, copy.maxFTSCandidates)
         copy.maxVectorCandidates = max(0, copy.maxVectorCandidates)
-        copy.maxRerankCandidates = max(0, copy.maxRerankCandidates)
         copy.maxSnippets = max(0, copy.maxSnippets)
-        if returnLimit > 0 {
-            copy.maxRerankCandidates = max(copy.maxRerankCandidates, returnLimit)
-        }
         return copy
     }
 }

@@ -1,3 +1,4 @@
+import ChartroomTestSupport
 import Foundation
 import Testing
 @testable import IndexEngine
@@ -229,7 +230,6 @@ struct IndexEngineFacadeTests {
             version: 1,
             maxFTSCandidates: 0,
             maxVectorCandidates: 0,
-            maxRerankCandidates: 0,
             maxSnippets: 0
         )
         let cappedEngine = try await IndexEngine.openInMemory(
@@ -705,7 +705,7 @@ private enum FixtureEmbeddingError: Error {
     case failed
 }
 
-private struct ThrowingEmbedder: Embedder {
+private struct ThrowingEmbedder: FixtureEmbedder {
     let modelID = "throwing-fixture"
     let dimension = 256
 
@@ -714,7 +714,7 @@ private struct ThrowingEmbedder: Embedder {
     }
 }
 
-private struct SlowCancellableEmbedder: Embedder {
+private struct SlowCancellableEmbedder: FixtureEmbedder {
     let modelID = "slow-cancellable"
     let dimension = 8
 
@@ -724,7 +724,7 @@ private struct SlowCancellableEmbedder: Embedder {
     }
 }
 
-private struct WrongQueryDimensionEmbedder: Embedder {
+private struct WrongQueryDimensionEmbedder: FixtureEmbedder {
     let modelID = "wrong-query-dimension"
     let dimension = 8
 
@@ -733,7 +733,7 @@ private struct WrongQueryDimensionEmbedder: Embedder {
     }
 }
 
-private struct WrongDocumentDimensionEmbedder: Embedder {
+private struct WrongDocumentDimensionEmbedder: FixtureEmbedder {
     let modelID = "wrong-document-dimension"
     let dimension = 8
 
@@ -742,7 +742,7 @@ private struct WrongDocumentDimensionEmbedder: Embedder {
     }
 }
 
-private struct QueryFailingEmbedder: Embedder {
+private struct QueryFailingEmbedder: FixtureEmbedder {
     let modelID = "query-failing-fixture"
     let dimension = 64
     private let healthy = HashingEmbedder(modelID: "query-failing-fixture", dimension: 64)
@@ -755,7 +755,7 @@ private struct QueryFailingEmbedder: Embedder {
 
 /// Fails only for payloads whose text contains "poison", and embeds everything else normally —
 /// so a single bad item can be placed in an otherwise healthy batch.
-private struct SelectivelyFailingEmbedder: Embedder {
+private struct SelectivelyFailingEmbedder: FixtureEmbedder {
     let modelID = "selective-fixture"
     let dimension = 64
     private let healthy = HashingEmbedder(modelID: "selective-fixture", dimension: 64)

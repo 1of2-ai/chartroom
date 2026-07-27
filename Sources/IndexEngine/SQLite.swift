@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import SQLite3
 
@@ -88,6 +89,14 @@ final class SQLite {
 final class Statement {
     private let stmt: OpaquePointer
     private let db: OpaquePointer
+    /// The first failed bind since the last `reset()`, rethrown by `step()`.
+    ///
+    /// Binding is a `void` operation at every call site in this package, so making it throw
+    /// would put `try` on several hundred lines to report a fault that only `step()` can act
+    /// on anyway. Deferring instead keeps the call sites clean and still fails loudly: a
+    /// statement that could not be bound never executes. Aborting the host process — which is
+    /// what a `precondition` here did — is not an option a library gets to take.
+    private var bindFailure: SQLiteError?
 
     init(stmt: OpaquePointer, db: OpaquePointer) { self.stmt = stmt; self.db = db }
     deinit { sqlite3_finalize(stmt) }
@@ -100,8 +109,11 @@ final class Statement {
         bytes.withUnsafeBytes { checkBind(sqlite3_bind_blob(stmt, i, $0.baseAddress, Int32($0.count), sqliteTransient())) }
     }
 
+    /// Records the first failure only: later binds on an already-failed statement report the
+    /// same fault, and the first one is the one that explains it.
     private func checkBind(_ rc: Int32) {
-        precondition(rc == SQLITE_OK, String(cString: sqlite3_errmsg(db)))
+        guard rc != SQLITE_OK, bindFailure == nil else { return }
+        bindFailure = SQLiteError(code: rc, message: String(cString: sqlite3_errmsg(db)))
     }
 
     /// Rewind for reuse: clears the row cursor and bindings so one prepared
@@ -109,10 +121,15 @@ final class Statement {
     func reset() {
         sqlite3_reset(stmt)
         sqlite3_clear_bindings(stmt)
+        bindFailure = nil
     }
 
     /// True if a row is available, false when the statement is done.
     @discardableResult func step() throws -> Bool {
+        if let bindFailure {
+            self.bindFailure = nil
+            throw bindFailure
+        }
         let rc = sqlite3_step(stmt)
         if rc == SQLITE_ROW { return true }
         if rc == SQLITE_DONE { return false }
@@ -126,10 +143,24 @@ final class Statement {
     func int(_ col: Int32) -> Int { Int(sqlite3_column_int64(stmt, col)) }
     func double(_ col: Int32) -> Double { sqlite3_column_double(stmt, col) }
     func null(_ col: Int32) -> Bool { sqlite3_column_type(stmt, col) == SQLITE_NULL }
+    /// For nullable integer columns, where `int(_:)` would report a missing value as 0 and make
+    /// "not recorded" indistinguishable from a real zero.
+    func optionalInt(_ col: Int32) -> Int? { null(col) ? nil : int(col) }
     func blob(_ col: Int32) -> [UInt8] {
         guard let p = sqlite3_column_blob(stmt, col) else { return [] }
         let n = Int(sqlite3_column_bytes(stmt, col))
         return Array(UnsafeRawBufferPointer(start: p, count: n))
+    }
+
+    /// Reads a blob column without copying it. SQLite owns the bytes and invalidates them at the
+    /// next `step()` or `reset()`, so `body` runs inside that window and must not escape the
+    /// buffer. Used by the vector scan, where copying every stored embedding into an array was
+    /// the scan's dominant cost.
+    func withBlob<T>(_ col: Int32, _ body: (UnsafeRawBufferPointer) -> T) -> T {
+        guard let pointer = sqlite3_column_blob(stmt, col) else {
+            return body(UnsafeRawBufferPointer(start: nil, count: 0))
+        }
+        return body(UnsafeRawBufferPointer(start: pointer, count: Int(sqlite3_column_bytes(stmt, col))))
     }
 }
 
@@ -138,20 +169,109 @@ final class Statement {
 enum Vector {
     static func toBytes(_ v: [Float]) -> [UInt8] { v.withUnsafeBytes { Array($0) } }
 
-    static func fromBytes(_ b: [UInt8]) -> [Float] {
-        let n = b.count / MemoryLayout<Float>.size
-        var out = [Float](repeating: 0, count: n)
-        out.withUnsafeMutableBytes { dst in
-            b.withUnsafeBytes { src in
-                if let base = src.baseAddress { dst.copyMemory(from: UnsafeRawBufferPointer(start: base, count: n * MemoryLayout<Float>.size)) }
-            }
-        }
-        return out
+    static func cosine(_ a: [Float], _ b: [Float]) -> Float {
+        let count = min(a.count, b.count)
+        var result: Float = 0
+        vDSP_dotpr(a, 1, b, 1, &result, vDSP_Length(count))
+        return result
     }
 
-    static func cosine(_ a: [Float], _ b: [Float]) -> Float {
-        var s: Float = 0
-        for i in 0..<a.count { s += a[i] * b[i] }
-        return s
+    /// Cosine of `query` against a stored vector still sitting in SQLite's own buffer.
+    ///
+    /// Returns nil when the blob is not exactly `query.count` floats, which is the stored-vector
+    /// dimension mismatch the caller reports rather than scoring past.
+    ///
+    /// SQLite gives no alignment guarantee for blob storage, and binding misaligned memory to
+    /// `Float` is undefined behaviour, so the aligned case scores in place and the misaligned one
+    /// pays for a single stack copy. Both avoid the two heap allocations per row — a `[UInt8]`
+    /// and a `[Float]` — that the scan used to make for every embedding in the store.
+    static func cosine(query: [Float], storedBytes: UnsafeRawBufferPointer) -> Float? {
+        let dimension = query.count
+        guard storedBytes.count == dimension * MemoryLayout<Float>.stride,
+              let base = storedBytes.baseAddress
+        else { return nil }
+
+        if Int(bitPattern: base).isMultiple(of: MemoryLayout<Float>.alignment) {
+            var result: Float = 0
+            vDSP_dotpr(query, 1, base.assumingMemoryBound(to: Float.self), 1, &result, vDSP_Length(dimension))
+            return result
+        }
+
+        return withUnsafeTemporaryAllocation(of: Float.self, capacity: dimension) { aligned in
+            guard let alignedBase = aligned.baseAddress else { return 0 }
+            memcpy(alignedBase, base, storedBytes.count)
+            var result: Float = 0
+            vDSP_dotpr(query, 1, alignedBase, 1, &result, vDSP_Length(dimension))
+            return result
+        }
+    }
+}
+
+/// The best `capacity` vector hits seen so far, as a min-heap on similarity.
+///
+/// Exact cosine search has no way to skip a stored vector — the top-k is only knowable after
+/// every candidate is scored — so the scan itself cannot be bounded. What *can* be bounded is
+/// what it retains: this keeps `k` entries instead of one per corpus chunk, and because a row's
+/// id is only read once the row is admitted, a large store no longer allocates a Swift `String`
+/// for every chunk it rejects.
+struct BoundedTopKHits {
+    private let capacity: Int
+    private var entries: [(similarity: Float, id: String)] = []
+
+    init(capacity: Int) {
+        self.capacity = max(0, capacity)
+        entries.reserveCapacity(self.capacity)
+    }
+
+    /// `id` is an autoclosure so a rejected row never materializes one. On a large store almost
+    /// every row is rejected, which is the whole point.
+    mutating func insert(similarity: Float, id: @autoclosure () -> String?) {
+        guard capacity > 0 else { return }
+        if entries.count == capacity {
+            guard similarity > entries[0].similarity, let id = id() else { return }
+            entries[0] = (similarity, id)
+            siftDown(from: 0)
+        } else {
+            guard let id = id() else { return }
+            entries.append((similarity, id))
+            siftUp(from: entries.count - 1)
+        }
+    }
+
+    /// Best first, ties broken by id so repeated identical queries return a stable order.
+    func sortedDescending() -> [(id: String, similarity: Float)] {
+        entries
+            .sorted { lhs, rhs in
+                lhs.similarity == rhs.similarity ? lhs.id < rhs.id : lhs.similarity > rhs.similarity
+            }
+            .map { (id: $0.id, similarity: $0.similarity) }
+    }
+
+    private mutating func siftUp(from index: Int) {
+        var child = index
+        while child > 0 {
+            let parent = (child - 1) / 2
+            guard entries[child].similarity < entries[parent].similarity else { return }
+            entries.swapAt(child, parent)
+            child = parent
+        }
+    }
+
+    private mutating func siftDown(from index: Int) {
+        var parent = index
+        while true {
+            let left = parent * 2 + 1
+            let right = left + 1
+            var smallest = parent
+            if left < entries.count, entries[left].similarity < entries[smallest].similarity {
+                smallest = left
+            }
+            if right < entries.count, entries[right].similarity < entries[smallest].similarity {
+                smallest = right
+            }
+            guard smallest != parent else { return }
+            entries.swapAt(parent, smallest)
+            parent = smallest
+        }
     }
 }
