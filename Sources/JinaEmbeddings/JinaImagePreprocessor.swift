@@ -49,11 +49,15 @@ public struct JinaImagePreprocessor {
     /// General variable-resolution patchify from a row-major RGB buffer already sized to (h,w) with
     /// h,w factor-aligned (e.g. a smart-resized image). Returns pixel_values (gh*gw, featuresPerPatch)
     /// in the merger's 2×2-block order plus the patch grid (gh=h/16, gw=w/16).
-    public func pixelValues(rgb: [UInt8], h: Int, w: Int) -> (pixels: [Float], gh: Int, gw: Int) {
-        let GH = h / (patch * merge), GW = w / (patch * merge)   // merge-block grid
-        let gh = h / patch, gw = w / patch                       // patch grid (for positions)
+    public func pixelValues(rgb: [UInt8], h: Int, w: Int) throws -> (pixels: [Float], gh: Int, gw: Int) {
+        let layout = try validatedRawTensorLayout(t: 1, h: h, w: w)
+        guard rgb.count == layout.expectedByteCount else {
+            throw ImageError.invalidBufferLength(expected: layout.expectedByteCount, actual: rgb.count)
+        }
+        let GH = layout.gh / merge, GW = layout.gw / merge       // merge-block grid
+        let gh = layout.gh, gw = layout.gw                        // patch grid (for positions)
         let FPP = featuresPerPatch, bpr = w * 3
-        var out = [Float](repeating: 0, count: gh * gw * FPP)
+        var out = [Float](repeating: 0, count: layout.elementCount)
         for bh in 0..<GH {
             for bw in 0..<GW {
                 for mh in 0..<merge {
@@ -80,7 +84,18 @@ public struct JinaImagePreprocessor {
         return (out, gh, gw)
     }
 
-    public enum ImageError: Error { case load(String), context, badVideoFrameCount(Int) }
+    public enum ImageError: Error {
+        case load(String)
+        case context
+        case badVideoFrameCount(Int)
+        case invalidDimensions(h: Int, w: Int, factor: Int)
+        case bufferSizeOverflow(h: Int, w: Int)
+        case invalidBufferLength(expected: Int, actual: Int)
+        case invalidTensorGrid(t: Int, gh: Int, gw: Int)
+        case unmergeableTensorGrid(gh: Int, gw: Int, merge: Int)
+        case tensorSizeOverflow(t: Int, gh: Int, gw: Int)
+        case invalidPixelValuesLength(expected: Int, actual: Int)
+    }
 
     public static func loadCGImage(_ url: URL) throws -> CGImage {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
@@ -97,10 +112,14 @@ public struct JinaImagePreprocessor {
     public func videoPixelValues(frames: [[UInt8]], h: Int, w: Int) throws -> (pixels: [Float], t: Int, gh: Int, gw: Int) {
         guard frames.count > 0, frames.count % temporal == 0 else { throw ImageError.badVideoFrameCount(frames.count) }
         let t = frames.count / temporal
-        let GH = h / (patch * merge), GW = w / (patch * merge)
-        let gh = h / patch, gw = w / patch
-        let FPP = featuresPerPatch, bpr = w * 3, fpatch = gh * gw
-        var out = [Float](repeating: 0, count: t * fpatch * FPP)
+        let layout = try validatedRawTensorLayout(t: t, h: h, w: w)
+        for frame in frames where frame.count != layout.expectedByteCount {
+            throw ImageError.invalidBufferLength(expected: layout.expectedByteCount, actual: frame.count)
+        }
+        let GH = layout.gh / merge, GW = layout.gw / merge
+        let gh = layout.gh, gw = layout.gw
+        let FPP = featuresPerPatch, bpr = w * 3, fpatch = layout.framePatchCount
+        var out = [Float](repeating: 0, count: layout.elementCount)
         for g in 0..<t {
             for bh in 0..<GH {
                 for bw in 0..<GW {
@@ -127,6 +146,79 @@ public struct JinaImagePreprocessor {
             }
         }
         return (out, t, gh, gw)
+    }
+
+    private func expectedRGBByteCount(h: Int, w: Int) throws -> Int {
+        guard h > 0, w > 0, h.isMultiple(of: factor), w.isMultiple(of: factor) else {
+            throw ImageError.invalidDimensions(h: h, w: w, factor: factor)
+        }
+        let (pixelCount, pixelCountOverflow) = h.multipliedReportingOverflow(by: w)
+        let (byteCount, byteCountOverflow) = pixelCount.multipliedReportingOverflow(by: 3)
+        guard !pixelCountOverflow, !byteCountOverflow else {
+            throw ImageError.bufferSizeOverflow(h: h, w: w)
+        }
+        return byteCount
+    }
+
+    private func validatedRawTensorLayout(
+        t: Int,
+        h: Int,
+        w: Int
+    ) throws -> (
+        expectedByteCount: Int,
+        gh: Int,
+        gw: Int,
+        framePatchCount: Int,
+        elementCount: Int
+    ) {
+        let expectedByteCount = try expectedRGBByteCount(h: h, w: w)
+        let gh = h / patch
+        let gw = w / patch
+        let layout = try validatedTensorLayout(t: t, gh: gh, gw: gw)
+        return (
+            expectedByteCount,
+            gh,
+            gw,
+            layout.framePatchCount,
+            layout.elementCount
+        )
+    }
+
+    private func validatedTensorLayout(
+        t: Int,
+        gh: Int,
+        gw: Int
+    ) throws -> (
+        framePatchCount: Int,
+        patchCount: Int,
+        elementCount: Int
+    ) {
+        guard t > 0, gh > 0, gw > 0 else {
+            throw ImageError.invalidTensorGrid(t: t, gh: gh, gw: gw)
+        }
+        guard gh.isMultiple(of: merge), gw.isMultiple(of: merge) else {
+            throw ImageError.unmergeableTensorGrid(gh: gh, gw: gw, merge: merge)
+        }
+        let (framePatchCount, framePatchOverflow) = gh.multipliedReportingOverflow(by: gw)
+        let (patchCount, patchCountOverflow) = t.multipliedReportingOverflow(by: framePatchCount)
+        let (elementCount, elementCountOverflow) = patchCount.multipliedReportingOverflow(by: featuresPerPatch)
+        guard !framePatchOverflow, !patchCountOverflow, !elementCountOverflow else {
+            throw ImageError.tensorSizeOverflow(t: t, gh: gh, gw: gw)
+        }
+        return (framePatchCount, patchCount, elementCount)
+    }
+
+    func validatedTensorShape(
+        pixelValuesCount: Int,
+        t: Int,
+        gh: Int,
+        gw: Int
+    ) throws -> (framePatchCount: Int, patchCount: Int, pixelDimension: Int) {
+        let layout = try validatedTensorLayout(t: t, gh: gh, gw: gw)
+        guard pixelValuesCount == layout.elementCount else {
+            throw ImageError.invalidPixelValuesLength(expected: layout.elementCount, actual: pixelValuesCount)
+        }
+        return (layout.framePatchCount, layout.patchCount, featuresPerPatch)
     }
 
     /// Draw a CGImage resized to (w,h) into an RGBA8 buffer and return packed RGB (h*w*3) row-major.

@@ -97,6 +97,106 @@ struct IndexStoreTests {
         #expect(olderHits.first?.snippet.contains("older") != true)
     }
 
+    @Test("deleting a not-yet-persisted document cancels its in-flight upsert")
+    func deleteCancelsInFlightFirstUpsert() async throws {
+        let gate = DeleteRaceGate()
+        let store = try IndexStore(path: ":memory:", embedder: DeleteRaceEmbedder(gate: gate))
+
+        let upsert = Task {
+            try await store.upsert(.init(
+                id: "doc",
+                type: "note",
+                title: "Race",
+                body: "content that must not be resurrected"
+            ))
+        }
+        await gate.waitForDocumentEmbedding()
+
+        #expect(try await store.delete(id: "doc") == false)
+        await gate.releaseDocumentEmbedding()
+        try await upsert.value
+
+        #expect(try await store.count() == 0)
+        #expect(try await store.chunkSummaries(documentID: "doc").isEmpty)
+        #expect(try await store.search("resurrected", limit: 5).isEmpty)
+    }
+
+    @Test("deleting through another store cancels an in-flight first upsert")
+    func crossStoreDeleteCancelsInFlightFirstUpsert() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cross-store-delete-\(UUID().uuidString).sqlite")
+            .path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let gate = DeleteRaceGate()
+        let writer = try IndexStore(path: path, embedder: DeleteRaceEmbedder(gate: gate))
+        let deleter = try IndexStore(
+            path: path,
+            embedder: HashingEmbedder(modelID: "delete-race-fixture", dimension: 4)
+        )
+
+        let upsert = Task {
+            try await writer.upsert(.init(
+                id: "doc",
+                type: "note",
+                title: "Race",
+                body: "cross-store content that must not be resurrected"
+            ))
+        }
+        await gate.waitForDocumentEmbedding()
+
+        #expect(try await deleter.delete(id: "doc") == false)
+        await gate.releaseDocumentEmbedding()
+        try await upsert.value
+
+        #expect(try await deleter.count() == 0)
+        #expect(try await writer.chunkSummaries(documentID: "doc").isEmpty)
+        #expect(try Self.rawCount(path: path, table: "document_mutations") == 0)
+    }
+
+    @Test("stale upsert cleanup cannot clear a newer mutation token")
+    func staleUpsertCleanupPreservesNewerMutationToken() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mutation-cleanup-\(UUID().uuidString).sqlite")
+            .path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let gate = MutationCleanupGate()
+        let store = try IndexStore(path: path, embedder: MutationCleanupEmbedder(gate: gate))
+
+        let older = Task {
+            try await store.upsert(.init(
+                id: "doc",
+                type: "note",
+                title: "Race",
+                body: "older mutation"
+            ))
+        }
+        await gate.waitForEmbedding("older")
+
+        let newer = Task {
+            try await store.upsert(.init(
+                id: "doc",
+                type: "note",
+                title: "Race",
+                body: "newer mutation"
+            ))
+        }
+        await gate.waitForEmbedding("newer")
+
+        await gate.releaseEmbedding("older")
+        try await older.value
+        #expect(try Self.rawCount(path: path, table: "document_mutations") == 1)
+
+        await gate.releaseEmbedding("newer")
+        try await newer.value
+        #expect(try Self.rawCount(path: path, table: "document_mutations") == 0)
+
+        let hits = try await store.search("newer", limit: 5)
+        #expect(hits.map(\.documentID) == ["doc"])
+        #expect(hits.first?.snippet.contains("newer") == true)
+    }
+
     @Test("search hits retain source and policy provenance")
     func searchHitsRetainProvenance() async throws {
         let store = try makeStore()
@@ -469,8 +569,8 @@ struct IndexStoreTests {
         #expect(hits.map(\.documentID) == ["target"])
     }
 
-    @Test("search ignores rows indexed with another embedding model")
-    func searchFiltersToCurrentModelSpace() async throws {
+    @Test("search keeps foreign-space rows out of vector scoring and provenance")
+    func searchFiltersVectorsToCurrentModelSpace() async throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("index-\(UUID().uuidString).sqlite")
             .path
@@ -482,7 +582,14 @@ struct IndexStoreTests {
         }
 
         let currentStore = try IndexStore(path: path, embedder: HashingEmbedder(modelID: "current-model", dimension: 256))
-        #expect(try await currentStore.search("thermal", limit: 5).isEmpty)
+        let response = try await currentStore.searchDetailed("thermal", limit: 5)
+        let lexicalHit = try #require(response.hits.first)
+        #expect(lexicalHit.documentID == "a")
+        #expect(lexicalHit.keywordRank == 1)
+        #expect(lexicalHit.vectorRank == nil)
+        #expect(lexicalHit.similarity == nil)
+        #expect(lexicalHit.embeddingSpaceID == nil)
+        #expect(response.diagnostics.embeddingSpaceMismatch)
     }
 
     @Test("counts binds embedding space IDs instead of interpolating SQL")
@@ -670,6 +777,85 @@ private struct GatedRaceEmbedder: FixtureEmbedder {
         try await gate.delayIfOlder(text)
         if text.contains("older") {
             return [0, 1, 0, 0]
+        }
+        return [1, 0, 0, 0]
+    }
+}
+
+private actor MutationCleanupGate {
+    private var embeddingStarted: Set<String> = []
+    private var startedContinuations: [String: CheckedContinuation<Void, Never>] = [:]
+    private var releaseContinuations: [String: CheckedContinuation<Void, Never>] = [:]
+
+    func suspendEmbedding(_ marker: String) async {
+        embeddingStarted.insert(marker)
+        startedContinuations.removeValue(forKey: marker)?.resume()
+        await withCheckedContinuation { continuation in
+            releaseContinuations[marker] = continuation
+        }
+    }
+
+    func waitForEmbedding(_ marker: String) async {
+        if embeddingStarted.contains(marker) { return }
+        await withCheckedContinuation { continuation in
+            startedContinuations[marker] = continuation
+        }
+    }
+
+    func releaseEmbedding(_ marker: String) {
+        releaseContinuations.removeValue(forKey: marker)?.resume()
+    }
+}
+
+private struct MutationCleanupEmbedder: FixtureEmbedder {
+    let modelID = "mutation-cleanup-fixture"
+    let dimension = 4
+    let gate: MutationCleanupGate
+
+    func embed(_ text: String, kind: EmbedKind) async throws -> [Float] {
+        if kind == .document {
+            let marker = text.contains("older") ? "older" : "newer"
+            await gate.suspendEmbedding(marker)
+        }
+        return text.contains("older") ? [0, 1, 0, 0] : [1, 0, 0, 0]
+    }
+}
+
+private actor DeleteRaceGate {
+    private var documentEmbeddingStarted = false
+    private var startedContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspendDocumentEmbedding() async {
+        documentEmbeddingStarted = true
+        startedContinuation?.resume()
+        startedContinuation = nil
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitForDocumentEmbedding() async {
+        if documentEmbeddingStarted { return }
+        await withCheckedContinuation { continuation in
+            startedContinuation = continuation
+        }
+    }
+
+    func releaseDocumentEmbedding() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private struct DeleteRaceEmbedder: FixtureEmbedder {
+    let modelID = "delete-race-fixture"
+    let dimension = 4
+    let gate: DeleteRaceGate
+
+    func embed(_ text: String, kind: EmbedKind) async throws -> [Float] {
+        if kind == .document {
+            await gate.suspendDocumentEmbedding()
         }
         return [1, 0, 0, 0]
     }

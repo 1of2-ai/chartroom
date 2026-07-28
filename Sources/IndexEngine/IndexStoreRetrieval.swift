@@ -83,22 +83,34 @@ extension IndexStore {
         var vectorLatency: TimeInterval?
 
         if vectorLimit > 0 {
-            do {
-                let qvec = try await embedder.embed(normalizedQuery, kind: .query)
-                try validateEmbedding(qvec, kind: .query)
-                let vectorStart = Date.now
-                let scoredVector = try vectorIDs(qvec, hardCluster: hardCluster, filters: filters, limit: vectorLimit)
-                vector = scoredVector.map(\.id)
-                similarities = Dictionary(
-                    scoredVector.map { ($0.id, Double($0.similarity)) },
-                    uniquingKeysWith: { first, _ in first }
-                )
-                vectorLatency = Date.now.timeIntervalSince(vectorStart)
-            } catch {
+            if let requestedEmbeddingSpaceID = filters.embeddingSpaceID?.rawValue,
+               requestedEmbeddingSpaceID != embeddingSpaceID {
                 if allowDegradedResults {
                     missingChannels.append(.vector)
                 } else {
-                    throw error
+                    throw IndexStoreError.embeddingSpaceMismatch(
+                        expected: embeddingSpaceID,
+                        actual: requestedEmbeddingSpaceID
+                    )
+                }
+            } else {
+                do {
+                    let qvec = try await embedder.embed(normalizedQuery, kind: .query)
+                    try validateEmbedding(qvec, kind: .query)
+                    let vectorStart = Date.now
+                    let scoredVector = try vectorIDs(qvec, hardCluster: hardCluster, filters: filters, limit: vectorLimit)
+                    vector = scoredVector.map(\.id)
+                    similarities = Dictionary(
+                        scoredVector.map { ($0.id, Double($0.similarity)) },
+                        uniquingKeysWith: { first, _ in first }
+                    )
+                    vectorLatency = Date.now.timeIntervalSince(vectorStart)
+                } catch {
+                    if allowDegradedResults {
+                        missingChannels.append(.vector)
+                    } else {
+                        throw error
+                    }
                 }
             }
         }
@@ -140,7 +152,10 @@ extension IndexStore {
         .prefix(clampedLimit)
 
         let weakThreshold = Double(embedder.weakSimilarityThreshold)
-        let metadataByChunkID = try meta(for: orderedIDs.map(\.key))
+        let metadataByChunkID = try meta(
+            for: orderedIDs.map(\.key),
+            embeddingSpaceID: filters.embeddingSpaceID?.rawValue ?? embeddingSpaceID
+        )
         var hits: [SearchHit] = []
         hits.reserveCapacity(orderedIDs.count)
         for (chunkID, score) in orderedIDs {
@@ -181,8 +196,19 @@ extension IndexStore {
         let fusionLatency = Date.now.timeIntervalSince(fusionStart)
         // Only worth a query when the vector channel was asked for and came back empty: that is
         // the one outcome an embedding-space mismatch is indistinguishable from.
+        let coverage = vectorLimit > 0 && vector.isEmpty
+            ? try? embeddingSpaceCoverage()
+            : nil
         let embeddingSpaceMismatch = vectorLimit > 0 && vector.isEmpty
-            && ((try? embeddingSpaceCoverage().isOrphaned) ?? false)
+            && (coverage?.isOrphaned ?? false)
+        if embeddingSpaceMismatch, !allowDegradedResults {
+            throw IndexStoreError.embeddingSpaceMismatch(
+                expected: embeddingSpaceID,
+                actual: coverage?.storedSpaces
+                    .map(\.id.rawValue)
+                    .joined(separator: ",") ?? "unknown"
+            )
+        }
         return (
             hits,
             SearchDiagnostics(
@@ -205,11 +231,10 @@ extension IndexStore {
         filters: SearchFilters,
         limit: Int
     ) throws -> [String] {
-        let filter = candidateFilterSQL(hardCluster: hardCluster, filters: filters)
+        let filter = lexicalCandidateFilterSQL(hardCluster: hardCluster, filters: filters)
         let statement = try db.prepare("""
         SELECT chunks.id FROM chunks
         JOIN documents ON documents.id = chunks.document_id
-        JOIN embeddings ON embeddings.chunk_id = chunks.id
         WHERE chunks.active = 1 AND \(filter.whereSQL)
           AND (documents.title LIKE ? ESCAPE '\\'
                OR documents.source_uri LIKE ? ESCAPE '\\')
@@ -246,12 +271,11 @@ extension IndexStore {
         let tokens = HashingEmbedder.tokens(query)
         guard !tokens.isEmpty else { return [] }
         let match = tokens.map { "\"\($0)\"" }.joined(separator: " OR ")
-        let filter = candidateFilterSQL(hardCluster: hardCluster, filters: filters)
+        let filter = lexicalCandidateFilterSQL(hardCluster: hardCluster, filters: filters)
         let statement = try db.prepare("""
         SELECT chunks_fts.chunk_id, bm25(chunks_fts) FROM chunks_fts
         JOIN chunks ON chunks.id = chunks_fts.chunk_id
         JOIN documents ON documents.id = chunks.document_id
-        JOIN embeddings ON embeddings.chunk_id = chunks.id
         WHERE chunks_fts MATCH ? AND chunks.active = 1 AND \(filter.whereSQL)
         ORDER BY bm25(chunks_fts) ASC LIMIT ?
         """)
@@ -288,7 +312,11 @@ extension IndexStore {
         limit: Int
     ) throws -> [(id: String, similarity: Float)] {
         guard limit > 0 else { return [] }
-        let filter = candidateFilterSQL(hardCluster: hardCluster, filters: filters)
+        let filter = candidateFilterSQL(
+            hardCluster: hardCluster,
+            filters: filters,
+            embeddingSpaceID: embeddingSpaceID
+        )
         let statement = try db.prepare("""
         SELECT chunks.id, vectors.vec FROM embeddings
         JOIN vectors ON vectors.id = embeddings.id
@@ -317,15 +345,39 @@ extension IndexStore {
         return best.sortedDescending()
     }
 
-    private func candidateFilterSQL(
+    private func lexicalCandidateFilterSQL(
         hardCluster: String?,
         filters: SearchFilters
     ) -> CandidateFilter {
-        var clauses = [
-            "documents.is_deleted = 0",
-            "embeddings.embedding_space_id = ?"
-        ]
-        var bindings = [filters.embeddingSpaceID?.rawValue ?? embeddingSpaceID]
+        var filter = candidateFilterSQL(
+            hardCluster: hardCluster,
+            filters: filters,
+            embeddingSpaceID: nil
+        )
+        if let embeddingSpaceID = filters.embeddingSpaceID?.rawValue {
+            filter.whereSQL += """
+             AND EXISTS (
+              SELECT 1 FROM embeddings
+              WHERE embeddings.chunk_id = chunks.id AND embeddings.embedding_space_id = ?
+            )
+            """
+            filter.bindings.append(embeddingSpaceID)
+        }
+        return filter
+    }
+
+    private func candidateFilterSQL(
+        hardCluster: String?,
+        filters: SearchFilters,
+        embeddingSpaceID: String?
+    ) -> CandidateFilter {
+        var clauses = ["documents.is_deleted = 0"]
+        var bindings: [String] = []
+
+        if let embeddingSpaceID {
+            clauses.append("embeddings.embedding_space_id = ?")
+            bindings.append(embeddingSpaceID)
+        }
 
         if let hardCluster {
             clauses.append("documents.cluster_id = ?")
@@ -372,7 +424,10 @@ extension IndexStore {
     /// size, so a 100-result page parsed and ran 100 identical queries. One `IN (…)` returns the
     /// same rows in a single pass; the caller re-imposes the fused order, which SQL does not
     /// preserve and was never asked to.
-    private func meta(for chunkIDs: [String]) throws -> [String: ChunkRetrievalMetadata] {
+    private func meta(
+        for chunkIDs: [String],
+        embeddingSpaceID: String
+    ) throws -> [String: ChunkRetrievalMetadata] {
         guard !chunkIDs.isEmpty else { return [:] }
 
         // Chunk ids are bound, never interpolated; only the placeholder count varies with the page.

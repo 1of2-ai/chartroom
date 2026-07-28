@@ -92,4 +92,138 @@ struct VaultTests {
         let hits = try await store.search("thermal", limit: 5)
         #expect(hits.first?.documentID == "good.md")
     }
+
+    @Test("vault ingestion never follows a markdown symlink outside the resolved root")
+    func skipsOutsideSymlink() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("vault-link-\(UUID().uuidString)")
+        let vault = base.appendingPathComponent("Vault")
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        try "# Inside\nsearchable local note"
+            .write(to: vault.appendingPathComponent("inside.md"), atomically: true, encoding: .utf8)
+        let outside = base.appendingPathComponent("outside.md")
+        try "# Secret\noutside vault content"
+            .write(to: outside, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: vault.appendingPathComponent("linked.md"),
+            withDestinationURL: outside
+        )
+
+        #expect(Vault.markdownFiles(in: vault).map(\.lastPathComponent) == ["inside.md"])
+    }
+
+    @Test("vault ingestion skips hidden files and package descendants")
+    func skipsHiddenFilesAndPackages() throws {
+        let vault = FileManager.default.temporaryDirectory.appendingPathComponent("vault-hidden-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: vault) }
+
+        try "# Visible\nincluded"
+            .write(to: vault.appendingPathComponent("visible.md"), atomically: true, encoding: .utf8)
+        try "# Hidden\nexcluded"
+            .write(to: vault.appendingPathComponent(".hidden.md"), atomically: true, encoding: .utf8)
+        let package = vault.appendingPathComponent("Archived.bundle")
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try "# Packaged\nexcluded"
+            .write(to: package.appendingPathComponent("packaged.md"), atomically: true, encoding: .utf8)
+
+        #expect(Vault.markdownFiles(in: vault).map(\.lastPathComponent) == ["visible.md"])
+    }
+
+    @Test("vault ingestion ignores non-regular markdown entries")
+    func skipsNonRegularMarkdownEntries() throws {
+        let vault = FileManager.default.temporaryDirectory.appendingPathComponent("vault-regular-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: vault) }
+        try FileManager.default.createDirectory(
+            at: vault.appendingPathComponent("directory.md"),
+            withIntermediateDirectories: true
+        )
+
+        #expect(Vault.markdownFiles(in: vault).isEmpty)
+    }
+
+    @Test("vault ingestion enforces the local-file 20 MiB bound")
+    func skipsOversizedMarkdown() throws {
+        let vault = FileManager.default.temporaryDirectory.appendingPathComponent("vault-large-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: vault) }
+        try Data(repeating: 0x61, count: 20 * 1024 * 1024 + 1)
+            .write(to: vault.appendingPathComponent("oversized.md"))
+
+        #expect(Vault.markdownFiles(in: vault).isEmpty)
+    }
+
+    @Test("secure vault reads reject a discovered file replaced by an outside symlink")
+    func secureReadRejectsAcceptedFileReplacement() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vault-replaced-file-\(UUID().uuidString)")
+        let vault = base.appendingPathComponent("Vault")
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let acceptedPath = vault.appendingPathComponent("accepted.md")
+        try "# Accepted\ninside content"
+            .write(to: acceptedPath, atomically: true, encoding: .utf8)
+        let outsidePath = base.appendingPathComponent("outside.md")
+        try "# Outside\nmust never be read"
+            .write(to: outsidePath, atomically: true, encoding: .utf8)
+
+        let reader = try VaultFileReader(rootURL: vault)
+        let acceptedURL = try #require(Vault.markdownFiles(in: reader.rootURL).first)
+        try FileManager.default.removeItem(at: acceptedPath)
+        try FileManager.default.createSymbolicLink(at: acceptedPath, withDestinationURL: outsidePath)
+
+        #expect(throws: VaultFileReadError.self) {
+            _ = try reader.readMarkdown(at: acceptedURL)
+        }
+    }
+
+    @Test("secure vault reads reject a discovered file whose ancestor becomes a symlink")
+    func secureReadRejectsAcceptedAncestorReplacement() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vault-replaced-ancestor-\(UUID().uuidString)")
+        let vault = base.appendingPathComponent("Vault")
+        let notes = vault.appendingPathComponent("Notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let acceptedPath = notes.appendingPathComponent("accepted.md")
+        try "# Accepted\ninside content"
+            .write(to: acceptedPath, atomically: true, encoding: .utf8)
+        let outsideDirectory = base.appendingPathComponent("Outside")
+        try FileManager.default.createDirectory(at: outsideDirectory, withIntermediateDirectories: true)
+        try "# Outside\nmust never be read"
+            .write(
+                to: outsideDirectory.appendingPathComponent("accepted.md"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+        let reader = try VaultFileReader(rootURL: vault)
+        let acceptedURL = try #require(Vault.markdownFiles(in: reader.rootURL).first)
+        try FileManager.default.removeItem(at: notes)
+        try FileManager.default.createSymbolicLink(at: notes, withDestinationURL: outsideDirectory)
+
+        #expect(throws: VaultFileReadError.self) {
+            _ = try reader.readMarkdown(at: acceptedURL)
+        }
+    }
+
+    @Test("secure vault reads accept a markdown file exactly 20 MiB long")
+    func secureReadAcceptsExactSizeBoundary() throws {
+        let vault = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vault-size-boundary-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: vault) }
+
+        let boundarySize = 20 * 1024 * 1024
+        let file = vault.appendingPathComponent("boundary.md")
+        try Data(repeating: 0x61, count: boundarySize).write(to: file)
+
+        let reader = try VaultFileReader(rootURL: vault)
+        let acceptedURL = try #require(Vault.markdownFiles(in: reader.rootURL).first)
+        #expect(try reader.readMarkdown(at: acceptedURL).utf8.count == boundarySize)
+    }
 }

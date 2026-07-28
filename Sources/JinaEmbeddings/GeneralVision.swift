@@ -258,7 +258,7 @@ public final class JinaImageEmbedderMasked: @unchecked Sendable {
     /// Raw RGB (h*w*3, h/w factor-aligned) -> embedding. Exact (no resample) — the full host path.
     /// Requires (h/16)*(w/16) ≤ maxPatches; use `embed(imageURL:)` for arbitrary sizes (it downscales).
     public func embed(rgb: [UInt8], h: Int, w: Int, dim: Int? = nil) throws -> [Float] {
-        let (pv, gh, gw) = preprocessor.pixelValues(rgb: rgb, h: h, w: w)
+        let (pv, gh, gw) = try preprocessor.pixelValues(rgb: rgb, h: h, w: w)
         guard gh * gw <= maxPatches else { throw VisionCoreMLEncoderMasked.EncoderError.noOutput }
         return try embed(pixelValues: pv, gh: gh, gw: gw, dim: dim)
     }
@@ -275,8 +275,14 @@ public final class JinaImageEmbedderMasked: @unchecked Sendable {
 
     /// `pixelValues` = (gh·gw · pixelDim) row-major (processor output). Returns the embedding.
     public func embed(pixelValues: [Float], gh: Int, gw: Int, dim: Int? = nil) throws -> [Float] {
-        let L = gh * gw
-        let pixelDim = pixelValues.count / L
+        let shape = try preprocessor.validatedTensorShape(
+            pixelValuesCount: pixelValues.count,
+            t: 1,
+            gh: gh,
+            gw: gw
+        )
+        let L = shape.patchCount
+        let pixelDim = shape.pixelDimension
         let (pe, cosv, sinv, merged) = positions.compute(gh: gh, gw: gw)
         let full = try encoder.encode(pixelValues: pixelValues, pixelDim: pixelDim,
                                       posEmbeds: pe, hidden: positions.hidden,
@@ -284,7 +290,7 @@ public final class JinaImageEmbedderMasked: @unchecked Sendable {
         let used = Array(full[0 ..< (merged * 1024)])
         let ids = Self.prefix + Array(repeating: Self.imagePad, count: merged) + Self.suffix
         let emb = try decoder.decode(tokenIds: ids, features: used, scatterOffset: Self.prefix.count)
-        if let d = dim { return matryoshka(emb, dim: d) }
+        if let d = dim { return try matryoshka(emb, dim: d) }
         return emb
     }
 }
@@ -407,8 +413,14 @@ public final class JinaVideoEmbedderMasked: @unchecked Sendable {
 
     /// `pixelValues` = (t·gh·gw · pixelDim) row-major (video processor output); grid (t,gh,gw).
     public func embed(pixelValues: [Float], t: Int, gh: Int, gw: Int, dim: Int? = nil) throws -> [Float] {
-        let fp = gh * gw, L = t * fp
-        let pixelDim = pixelValues.count / L
+        let shape = try preprocessor.validatedTensorShape(
+            pixelValuesCount: pixelValues.count,
+            t: t,
+            gh: gh,
+            gw: gw
+        )
+        let fp = shape.framePatchCount
+        let pixelDim = shape.pixelDimension
         let (pe, cosv, sinv, merged) = positions.computeVideo(t: t, gh: gh, gw: gw)
         let full = try encoder.encode(pixelValues: pixelValues, pixelDim: pixelDim, posEmbeds: pe,
                                       hidden: positions.hidden, cos: cosv, sin: sinv,
@@ -416,7 +428,7 @@ public final class JinaVideoEmbedderMasked: @unchecked Sendable {
         let used = Array(full[0 ..< (merged * 1024)])
         let ids = Self.prefix + Array(repeating: Self.videoPad, count: merged) + Self.suffix
         let emb = try decoder.decode(tokenIds: ids, features: used, scatterOffset: Self.prefix.count)
-        if let d = dim { return matryoshka(emb, dim: d) }
+        if let d = dim { return try matryoshka(emb, dim: d) }
         return emb
     }
 }

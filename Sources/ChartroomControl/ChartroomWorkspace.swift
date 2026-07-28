@@ -1,3 +1,4 @@
+import Darwin
 import ConnectorEngine
 import Foundation
 import IndexEngine
@@ -141,6 +142,8 @@ public actor ChartroomWorkspace {
     private var loaded = false
     private var storedIndexes: [ChartroomIndex] = []
     private var sessions: [UUID: ChartroomSession] = [:]
+    private var storeDeletionBindings: [StoreDeletionKey: StoreDeletionBinding] = [:]
+    private var storeDirectoryAnchors: [StoreEntryIdentity: StoreDirectoryAnchor] = [:]
 
     /// - Parameters:
     ///   - catalogURL: Durable JSON catalog location chosen by the host application.
@@ -172,23 +175,37 @@ public actor ChartroomWorkspace {
     public func createIndex(named name: String) throws -> ChartroomIndex {
         try loadCatalogIfNeeded()
         let name = try validatedName(name, excluding: nil)
+        try FileManager.default.createDirectory(
+            at: storesDirectory,
+            withIntermediateDirectories: true
+        )
+        let storesAnchor = try storeDirectoryAnchor(for: storesDirectory)
+        let directoryName = UUID().uuidString
+        let directoryIdentity = try storesAnchor.createDirectory(named: directoryName)
         let index = ChartroomIndex(
             name: name,
             storeURL: storesDirectory
-                .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+                .appending(path: directoryName, directoryHint: .isDirectory)
                 .appending(path: "IndexEngine.sqlite")
         )
+        let deletionBinding = StoreDeletionBinding.managed(
+            parent: storesAnchor,
+            directoryName: directoryName,
+            identity: directoryIdentity
+        )
 
-        let directory = index.storeURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
             storedIndexes.append(index)
             try persistCatalog()
         } catch {
             storedIndexes.removeLast()
-            try? FileManager.default.removeItem(at: directory)
+            try? storesAnchor.removeDirectoryTree(
+                named: directoryName,
+                expectedIdentity: directoryIdentity
+            )
             throw error
         }
+        storeDeletionBindings[StoreDeletionKey(index)] = deletionBinding
         return index
     }
 
@@ -218,10 +235,13 @@ public actor ChartroomWorkspace {
     /// The catalog is updated first, so a failure to delete the files leaves an orphaned store on
     /// disk rather than a catalog entry pointing at a store that is partially gone.
     @discardableResult
-    public func deleteIndex(_ indexID: UUID) throws -> ChartroomIndex {
+    public func deleteIndex(_ indexID: UUID) async throws -> ChartroomIndex {
         try loadCatalogIfNeeded()
         guard let position = storedIndexes.firstIndex(where: { $0.id == indexID }) else {
             throw unavailableIndexError(indexID)
+        }
+        if sessions[indexID]?.isOperationActiveOnCurrentTask() == true {
+            throw deleteFromActiveOperationError(indexID)
         }
 
         let index = storedIndexes[position]
@@ -233,8 +253,10 @@ public actor ChartroomWorkspace {
             throw error
         }
 
-        sessions[indexID] = nil
-        removeStoreFiles(for: index)
+        let session = sessions.removeValue(forKey: indexID)
+        await session?.invalidateAndWait()
+        let binding = storeDeletionBindings.removeValue(forKey: StoreDeletionKey(index))
+        try removeStoreFiles(for: index, binding: binding)
         return index
     }
 
@@ -243,21 +265,124 @@ public actor ChartroomWorkspace {
     /// The containing directory is removed only when the workspace created it — one directory per
     /// index under `storesDirectory`. An adopted store such as the legacy bootstrap index lives
     /// beside the catalog itself, and deleting *that* parent would take the whole workspace with it.
-    private func removeStoreFiles(for index: ChartroomIndex) {
-        let store = index.storeURL
-        for suffix in ["", "-wal", "-shm"] {
-            let url = suffix.isEmpty
-                ? store
-                : store.deletingLastPathComponent()
-                    .appending(path: store.lastPathComponent + suffix)
-            try? FileManager.default.removeItem(at: url)
+    private func removeStoreFiles(
+        for index: ChartroomIndex,
+        binding: StoreDeletionBinding?
+    ) throws {
+        var failures: [String] = []
+        switch binding {
+        case let .managed(parent, directoryName, identity):
+            do {
+                try parent.removeDirectoryTree(
+                    named: directoryName,
+                    expectedIdentity: identity
+                )
+            } catch {
+                failures.append("\(directoryName): \(error)")
+            }
+        case let .adopted(parent, storeName, storeIdentity):
+            do {
+                guard let storeIdentity else {
+                    try parent.verifyEntryAbsent(named: storeName)
+                    break
+                }
+                try parent.removeFileIfPresent(
+                    named: storeName,
+                    expectedIdentity: storeIdentity
+                )
+                for suffix in ["-wal", "-shm"] {
+                    try parent.removeFileIfPresent(named: storeName + suffix)
+                }
+            } catch {
+                failures.append("\(storeName): \(error)")
+            }
+        case let .managedLeafAbsent(parent, directoryName):
+            do {
+                try parent.verifyEntryAbsent(named: directoryName)
+            } catch {
+                failures.append("\(directoryName): \(error)")
+            }
+        case let .unavailable(detail):
+            failures.append(detail)
+        case nil:
+            failures.append("No deletion target was bound for \(index.storeURL.lastPathComponent).")
         }
 
+        guard !failures.isEmpty else { return }
+        throw IndexEngineError(
+            .deletionFailed,
+            code: "chartroom.workspace.store-delete-failed",
+            recoverability: .needsUserAction,
+            summary: "The index was removed from the catalog, but its store could not be deleted.",
+            detail: failures.joined(separator: "\n")
+        )
+    }
+
+    private func bindStoreDeletion(for index: ChartroomIndex) -> StoreDeletionBinding {
+        let store = index.storeURL
         let directory = store.deletingLastPathComponent()
-        guard directory.deletingLastPathComponent().standardizedFileURL == storesDirectory.standardizedFileURL else {
-            return
+        let managed = isManagedStoreDirectory(directory)
+
+        do {
+            if managed {
+                guard StoreDirectoryAnchor.isSafeLeafName(directory.lastPathComponent) else {
+                    return .unavailable("The managed store directory name is invalid.")
+                }
+                let parent = try storeDirectoryAnchor(for: storesDirectory)
+                guard let identity = try parent.entryIdentity(
+                    named: directory.lastPathComponent
+                ) else {
+                    return .managedLeafAbsent(
+                        parent: parent,
+                        directoryName: directory.lastPathComponent
+                    )
+                }
+                return .managed(
+                    parent: parent,
+                    directoryName: directory.lastPathComponent,
+                    identity: identity
+                )
+            }
+
+            guard StoreDirectoryAnchor.isSafeLeafName(store.lastPathComponent) else {
+                return .unavailable("The adopted store filename is invalid.")
+            }
+            let parent = try storeDirectoryAnchor(for: directory)
+            return .adopted(
+                parent: parent,
+                storeName: store.lastPathComponent,
+                storeIdentity: try parent.entryIdentity(named: store.lastPathComponent)
+            )
+        } catch {
+            return .unavailable("Could not bind the store cleanup location: \(error)")
         }
-        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func isManagedStoreDirectory(_ directory: URL) -> Bool {
+        guard UUID(uuidString: directory.lastPathComponent) != nil else {
+            return false
+        }
+
+        let candidateRoot = directory.deletingLastPathComponent()
+        if candidateRoot.standardizedFileURL == storesDirectory.standardizedFileURL {
+            return true
+        }
+
+        guard let candidateCanonical = try? StoreDirectoryAnchor.canonicalURL(for: candidateRoot),
+              let storesCanonical = try? StoreDirectoryAnchor.canonicalURL(for: storesDirectory) else {
+            return false
+        }
+        return candidateCanonical == storesCanonical
+    }
+
+    private func storeDirectoryAnchor(for url: URL) throws -> StoreDirectoryAnchor {
+        let opened = try StoreDirectoryAnchor(url: url)
+        if let existing = storeDirectoryAnchors[opened.identity] {
+            return existing
+        }
+
+        storeDirectoryAnchors[opened.identity] = opened
+        return opened
     }
 
     /// Re-embeds content the active model cannot read, restoring an index orphaned by a model
@@ -282,11 +407,46 @@ public actor ChartroomWorkspace {
 
         let factory = engineFactory
         let session = ChartroomSession(
-            engineFactory: { try await factory(index) },
+            engineFactory: { [weak self] in
+                guard let self else {
+                    return try await factory(index)
+                }
+                return try await self.openEngine(
+                    for: index,
+                    using: factory
+                )
+            },
             cursorStore: NamespacedCursorStore(base: cursorStore, namespace: indexID.uuidString)
         )
         sessions[indexID] = session
         return session
+    }
+
+    private func openEngine(
+        for index: ChartroomIndex,
+        using factory: EngineFactory
+    ) async throws -> (any IndexEngineClient, URL?) {
+        let before = bindStoreDeletion(for: index)
+        guard before.isSafeEngineTarget else {
+            storeDeletionBindings[StoreDeletionKey(index)] = .unavailable(
+                "The store path is not a regular file or managed directory."
+            )
+            throw storeBindingChangedError(index)
+        }
+        let opened = try await factory(index)
+
+        var openedIndex = index
+        openedIndex.storeURL = opened.1 ?? index.storeURL
+        let after = bindStoreDeletion(for: openedIndex)
+        guard before.hasSameTargetIdentity(as: after) else {
+            storeDeletionBindings[StoreDeletionKey(index)] = .unavailable(
+                "The store identity changed while its engine was opening."
+            )
+            throw storeBindingChangedError(index)
+        }
+
+        storeDeletionBindings[StoreDeletionKey(index)] = after
+        return opened
     }
 
     /// Searches all enabled indexes. One index failing to open or search never suppresses
@@ -423,6 +583,10 @@ public actor ChartroomWorkspace {
             try persistCatalog()
         }
 
+        storeDeletionBindings.removeAll(keepingCapacity: true)
+        for index in storedIndexes {
+            storeDeletionBindings[StoreDeletionKey(index)] = bindStoreDeletion(for: index)
+        }
         loaded = true
     }
 
@@ -482,6 +646,26 @@ public actor ChartroomWorkspace {
         )
     }
 
+    private func deleteFromActiveOperationError(_ indexID: UUID) -> IndexEngineError {
+        IndexEngineError(
+            .deletionFailed,
+            code: "chartroom.workspace.delete-from-active-operation",
+            recoverability: .retryable,
+            summary: "Finish the current index operation before deleting this index.",
+            detail: indexID.uuidString
+        )
+    }
+
+    private func storeBindingChangedError(_ index: ChartroomIndex) -> IndexEngineError {
+        IndexEngineError(
+            .storageUnavailable,
+            code: "chartroom.workspace.store-binding-changed",
+            recoverability: .retryable,
+            summary: "The index store changed while it was opening.",
+            detail: index.id.uuidString
+        )
+    }
+
     private static func normalizedName(_ name: String) -> String {
         name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
@@ -536,4 +720,418 @@ private struct NamespacedCursorStore: CursorStore {
 private enum SearchOutcome: Sendable {
     case success(ChartroomIndex, SearchResponse)
     case failure(ChartroomIndex, String)
+}
+
+private struct StoreDeletionKey: Hashable {
+    var indexID: UUID
+    var storeURL: URL
+
+    init(_ index: ChartroomIndex) {
+        self.indexID = index.id
+        self.storeURL = index.storeURL
+    }
+}
+
+private struct StoreEntryIdentity: Hashable {
+    var device: dev_t
+    var inode: ino_t
+    var fileType: mode_t
+
+    init(_ status: stat) {
+        self.device = status.st_dev
+        self.inode = status.st_ino
+        self.fileType = status.st_mode & S_IFMT
+    }
+}
+
+private enum StoreDeletionBinding {
+    case managed(
+        parent: StoreDirectoryAnchor,
+        directoryName: String,
+        identity: StoreEntryIdentity
+    )
+    case adopted(
+        parent: StoreDirectoryAnchor,
+        storeName: String,
+        storeIdentity: StoreEntryIdentity?
+    )
+    case managedLeafAbsent(
+        parent: StoreDirectoryAnchor,
+        directoryName: String
+    )
+    case unavailable(String)
+
+    var isSafeEngineTarget: Bool {
+        switch self {
+        case let .managed(_, _, identity):
+            return identity.fileType == S_IFDIR
+        case let .adopted(_, _, identity):
+            return identity == nil || identity?.fileType == S_IFREG
+        case .managedLeafAbsent, .unavailable:
+            return true
+        }
+    }
+
+    func hasSameTargetIdentity(as other: StoreDeletionBinding) -> Bool {
+        switch (self, other) {
+        case let (
+            .managed(lhsParent, lhsName, lhsIdentity),
+            .managed(rhsParent, rhsName, rhsIdentity)
+        ):
+            return lhsParent.identity == rhsParent.identity
+                && lhsName == rhsName
+                && lhsIdentity == rhsIdentity
+        case let (
+            .adopted(lhsParent, lhsName, lhsIdentity),
+            .adopted(rhsParent, rhsName, rhsIdentity)
+        ):
+            return lhsParent.identity == rhsParent.identity
+                && lhsName == rhsName
+                && lhsIdentity == rhsIdentity
+        case let (
+            .managedLeafAbsent(lhsParent, lhsName),
+            .managedLeafAbsent(rhsParent, rhsName)
+        ):
+            return lhsParent.identity == rhsParent.identity
+                && lhsName == rhsName
+        default:
+            return false
+        }
+    }
+}
+
+/// A directory identity captured before deletion is requested. Cleanup stays relative to this
+/// descriptor, so replacing any pathname component later cannot redirect destructive work.
+private final class StoreDirectoryAnchor {
+    struct Error: Swift.Error, CustomStringConvertible {
+        var operation: String
+        var item: String
+        var code: Int32
+
+        var description: String {
+            "\(operation) \(item): \(String(cString: strerror(code)))"
+        }
+    }
+
+    let canonicalURL: URL
+    let identity: StoreEntryIdentity
+    private let descriptor: Int32
+
+    init(url: URL) throws {
+        let canonicalURL = try Self.canonicalURL(for: url)
+        let descriptor = try Self.openCanonicalDirectory(canonicalURL)
+        var status = stat()
+        guard Darwin.fstat(descriptor, &status) == 0 else {
+            let code = Darwin.errno
+            Darwin.close(descriptor)
+            throw Error(operation: "inspect", item: canonicalURL.path, code: code)
+        }
+        self.canonicalURL = canonicalURL
+        self.identity = StoreEntryIdentity(status)
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        Darwin.close(descriptor)
+    }
+
+    static func isSafeLeafName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/")
+    }
+
+    static func canonicalURL(for url: URL) throws -> URL {
+        let path = url.path
+        let resolvedPath = path.withCString { Darwin.realpath($0, nil) }
+        guard let resolvedPath else {
+            let code = Darwin.errno
+            throw Error(operation: "resolve", item: path, code: code)
+        }
+        defer { Darwin.free(resolvedPath) }
+        return URL(filePath: String(cString: resolvedPath), directoryHint: .isDirectory)
+    }
+
+    func removeFileIfPresent(
+        named name: String,
+        expectedIdentity: StoreEntryIdentity? = nil
+    ) throws {
+        guard Self.isSafeLeafName(name) else {
+            throw Error(operation: "unlink", item: name, code: EINVAL)
+        }
+
+        if let expectedIdentity {
+            guard let tombstone = try detachVerifiedEntry(
+                named: name,
+                expectedIdentity: expectedIdentity
+            ) else {
+                return
+            }
+            let result = tombstone.withCString {
+                Darwin.unlinkat(descriptor, $0, 0)
+            }
+            guard result == 0 else {
+                throw Error(operation: "unlink", item: name, code: Darwin.errno)
+            }
+            return
+        }
+
+        let result = name.withCString {
+            Darwin.unlinkat(descriptor, $0, 0)
+        }
+        guard result == 0 else {
+            let code = Darwin.errno
+            if code == ENOENT {
+                return
+            }
+            throw Error(operation: "unlink", item: name, code: code)
+        }
+    }
+
+    func entryIdentity(named name: String) throws -> StoreEntryIdentity? {
+        guard Self.isSafeLeafName(name) else {
+            throw Error(operation: "inspect", item: name, code: EINVAL)
+        }
+
+        var status = stat()
+        let result = name.withCString {
+            Darwin.fstatat(descriptor, $0, &status, AT_SYMLINK_NOFOLLOW)
+        }
+        guard result == 0 else {
+            let code = Darwin.errno
+            if code == ENOENT {
+                return nil
+            }
+            throw Error(operation: "inspect", item: name, code: code)
+        }
+        return StoreEntryIdentity(status)
+    }
+
+    func verifyEntryAbsent(named name: String) throws {
+        guard try entryIdentity(named: name) == nil else {
+            throw Error(operation: "verify", item: name, code: EBUSY)
+        }
+    }
+
+    func createDirectory(named name: String) throws -> StoreEntryIdentity {
+        guard Self.isSafeLeafName(name) else {
+            throw Error(operation: "create", item: name, code: EINVAL)
+        }
+        let result = name.withCString {
+            Darwin.mkdirat(descriptor, $0, mode_t(0o700))
+        }
+        guard result == 0 else {
+            throw Error(operation: "create", item: name, code: Darwin.errno)
+        }
+        guard let identity = try entryIdentity(named: name),
+              identity.fileType == S_IFDIR else {
+            throw Error(operation: "verify", item: name, code: EIO)
+        }
+        return identity
+    }
+
+    func removeDirectoryTree(
+        named name: String,
+        expectedIdentity: StoreEntryIdentity
+    ) throws {
+        guard let tombstone = try detachVerifiedEntry(
+            named: name,
+            expectedIdentity: expectedIdentity
+        ) else {
+            return
+        }
+
+        try removeEntry(named: tombstone, from: descriptor)
+    }
+
+    /// Detaches one exact directory entry so later traversal cannot be redirected through its
+    /// public name. The identity is checked on both sides of the rename; a raced replacement is
+    /// restored without overwriting any entry that appeared at the original name.
+    private func detachVerifiedEntry(
+        named name: String,
+        expectedIdentity: StoreEntryIdentity
+    ) throws -> String? {
+        guard Self.isSafeLeafName(name) else {
+            throw Error(operation: "detach", item: name, code: EINVAL)
+        }
+        guard let currentIdentity = try entryIdentity(named: name) else {
+            return nil
+        }
+        guard currentIdentity == expectedIdentity else {
+            throw Error(operation: "verify", item: name, code: EBUSY)
+        }
+
+        let tombstone = "\(name).chartroom-delete-\(UUID().uuidString)"
+        let renameResult = name.withCString { sourceName in
+            tombstone.withCString { tombstoneName in
+                Darwin.renameat(descriptor, sourceName, descriptor, tombstoneName)
+            }
+        }
+        guard renameResult == 0 else {
+            let code = Darwin.errno
+            if code == ENOENT {
+                return nil
+            }
+            throw Error(operation: "detach", item: name, code: code)
+        }
+
+        guard try entryIdentity(named: tombstone) == expectedIdentity else {
+            let restoreResult = tombstone.withCString { tombstoneName in
+                name.withCString { originalName in
+                    Darwin.renameatx_np(
+                        descriptor,
+                        tombstoneName,
+                        descriptor,
+                        originalName,
+                        UInt32(RENAME_EXCL)
+                    )
+                }
+            }
+            let code = restoreResult == 0 ? EBUSY : Darwin.errno
+            throw Error(operation: "verify", item: name, code: code)
+        }
+        return tombstone
+    }
+
+    private func removeEntry(named name: String, from parentDescriptor: Int32) throws {
+        try name.withCString { namePointer in
+            try removeEntry(
+                namePointer: namePointer,
+                displayName: name,
+                from: parentDescriptor
+            )
+        }
+    }
+
+    private func removeEntry(
+        namePointer: UnsafePointer<CChar>,
+        displayName: String,
+        from parentDescriptor: Int32
+    ) throws {
+        var status = stat()
+        guard Darwin.fstatat(
+            parentDescriptor,
+            namePointer,
+            &status,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            let code = Darwin.errno
+            if code == ENOENT {
+                return
+            }
+            throw Error(operation: "inspect", item: displayName, code: code)
+        }
+
+        guard (status.st_mode & S_IFMT) == S_IFDIR else {
+            guard Darwin.unlinkat(parentDescriptor, namePointer, 0) == 0 else {
+                throw Error(
+                    operation: "unlink",
+                    item: displayName,
+                    code: Darwin.errno
+                )
+            }
+            return
+        }
+
+        let childDescriptor = Darwin.openat(
+            parentDescriptor,
+            namePointer,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard childDescriptor >= 0 else {
+            throw Error(operation: "open", item: displayName, code: Darwin.errno)
+        }
+        defer { Darwin.close(childDescriptor) }
+
+        var openedStatus = stat()
+        guard Darwin.fstat(childDescriptor, &openedStatus) == 0 else {
+            throw Error(operation: "inspect", item: displayName, code: Darwin.errno)
+        }
+        guard openedStatus.st_dev == status.st_dev,
+              openedStatus.st_ino == status.st_ino else {
+            throw Error(operation: "open", item: displayName, code: EBUSY)
+        }
+
+        try removeDirectoryContents(childDescriptor)
+
+        var finalStatus = stat()
+        guard Darwin.fstatat(
+            parentDescriptor,
+            namePointer,
+            &finalStatus,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            throw Error(operation: "inspect", item: displayName, code: Darwin.errno)
+        }
+        guard finalStatus.st_dev == openedStatus.st_dev,
+              finalStatus.st_ino == openedStatus.st_ino else {
+            throw Error(operation: "remove", item: displayName, code: EBUSY)
+        }
+        guard Darwin.unlinkat(parentDescriptor, namePointer, AT_REMOVEDIR) == 0 else {
+            throw Error(operation: "remove", item: displayName, code: Darwin.errno)
+        }
+    }
+
+    private func removeDirectoryContents(_ directoryDescriptor: Int32) throws {
+        let iteratorDescriptor = Darwin.dup(directoryDescriptor)
+        guard iteratorDescriptor >= 0 else {
+            throw Error(operation: "duplicate", item: canonicalURL.path, code: Darwin.errno)
+        }
+        guard let stream = Darwin.fdopendir(iteratorDescriptor) else {
+            let code = Darwin.errno
+            Darwin.close(iteratorDescriptor)
+            throw Error(operation: "enumerate", item: canonicalURL.path, code: code)
+        }
+        defer { Darwin.closedir(stream) }
+
+        while true {
+            Darwin.errno = 0
+            guard let entry = Darwin.readdir(stream) else {
+                let code = Darwin.errno
+                guard code == 0 else {
+                    throw Error(operation: "enumerate", item: canonicalURL.path, code: code)
+                }
+                return
+            }
+
+            let capacity = MemoryLayout.size(ofValue: entry.pointee.d_name)
+            try withUnsafePointer(to: &entry.pointee.d_name) { tuplePointer in
+                try tuplePointer.withMemoryRebound(
+                    to: CChar.self,
+                    capacity: capacity
+                ) { namePointer in
+                    let name = String(cString: namePointer)
+                    guard name != ".", name != ".." else { return }
+                    try removeEntry(
+                        namePointer: namePointer,
+                        displayName: name,
+                        from: directoryDescriptor
+                    )
+                }
+            }
+        }
+    }
+
+    private static func openCanonicalDirectory(_ url: URL) throws -> Int32 {
+        var descriptor = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw Error(operation: "open", item: "/", code: Darwin.errno)
+        }
+
+        for component in url.pathComponents where component != "/" {
+            let nextDescriptor = component.withCString {
+                Darwin.openat(
+                    descriptor,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+                )
+            }
+            guard nextDescriptor >= 0 else {
+                let code = Darwin.errno
+                Darwin.close(descriptor)
+                throw Error(operation: "open", item: url.path, code: code)
+            }
+            Darwin.close(descriptor)
+            descriptor = nextDescriptor
+        }
+        return descriptor
+    }
 }

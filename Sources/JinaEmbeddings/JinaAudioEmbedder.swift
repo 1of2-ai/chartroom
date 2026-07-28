@@ -7,12 +7,61 @@ import Foundation
 /// AVAudioConverter, which is not bit-identical to the reference's librosa resampler — a small
 /// resample-only caveat (analogous to the image CoreGraphics-vs-PIL note).
 public enum JinaAudioFile {
-    public enum DecodeError: Error { case converter, noData }
+    public enum DecodeError: Error {
+        case converter
+        case noData
+        case invalidMaximumSampleCount(Int)
+        case frameCapacityOverflow(
+            sourceFrameCount: AVAudioFramePosition,
+            inputSampleRate: Double?
+        )
+    }
 
+    struct BoundedDecode: Sendable {
+        var samples: [Float]
+        var sourceFramesRead: AVAudioFramePosition
+    }
+
+    private static let outputSampleRate = 16_000.0
+    private static let boundedInputChunkFrames: AVAudioFrameCount = 8_192
+    /// Keep a small bounded conversion tail so the returned prefix has the same resampler context
+    /// as an unbounded conversion. This preserves the existing decoder's `+ 4096` output slack.
+    static let resamplingLookaheadSampleCount = 4_096
+
+    /// Decode a complete file to 16 kHz mono.
     public static func decode16kMono(_ url: URL) throws -> [Float] {
-        let file = try AVAudioFile(forReading: url)
+        try decodeUnbounded(AVAudioFile(forReading: url))
+    }
+
+    /// Decode a bounded prefix. Resampling reads a separately bounded lookahead so the returned
+    /// samples match the same prefix of a full conversion.
+    public static func decode16kMono(
+        _ url: URL,
+        maximumSampleCount: Int
+    ) throws -> [Float] {
+        try decodeBounded(
+            url,
+            maximumSampleCount: maximumSampleCount
+        ).samples
+    }
+
+    static func decodeBounded(
+        _ url: URL,
+        maximumSampleCount: Int
+    ) throws -> BoundedDecode {
+        try decodeBounded(
+            AVAudioFile(forReading: url),
+            maximumSampleCount: maximumSampleCount
+        )
+    }
+
+    private static func decodeUnbounded(_ file: AVAudioFile) throws -> [Float] {
         let inFormat = file.processingFormat   // always float32, file's rate + channels
-        guard let inBuf = AVAudioPCMBuffer(pcmFormat: inFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
+        let inputFrameCapacity = try checkedFrameCapacity(file.length)
+        guard let inBuf = AVAudioPCMBuffer(
+            pcmFormat: inFormat,
+            frameCapacity: inputFrameCapacity
+        ) else {
             throw DecodeError.converter
         }
         try file.read(into: inBuf)
@@ -26,8 +75,10 @@ public enum JinaAudioFile {
               let converter = AVAudioConverter(from: inFormat, to: outFormat) else {
             throw DecodeError.converter
         }
-        let ratio = 16000.0 / inFormat.sampleRate
-        let outCap = AVAudioFrameCount(Double(file.length) * ratio) + 4096
+        let outCap = try resampledFrameCapacity(
+            sourceFrameCount: file.length,
+            inputSampleRate: inFormat.sampleRate
+        )
         guard let outBuf = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outCap) else { throw DecodeError.converter }
         let input = AudioConverterInput(buffer: inBuf)
         var convErr: NSError?
@@ -39,6 +90,152 @@ public enum JinaAudioFile {
         let n = Int(outBuf.frameLength)
         guard n > 0, let ch = outBuf.floatChannelData else { throw DecodeError.noData }
         return Array(UnsafeBufferPointer(start: ch[0], count: n))
+    }
+
+    static func checkedFrameCapacity(
+        _ sourceFrameCount: AVAudioFramePosition
+    ) throws -> AVAudioFrameCount {
+        guard let capacity = AVAudioFrameCount(exactly: sourceFrameCount) else {
+            throw DecodeError.frameCapacityOverflow(
+                sourceFrameCount: sourceFrameCount,
+                inputSampleRate: nil
+            )
+        }
+        return capacity
+    }
+
+    static func resampledFrameCapacity(
+        sourceFrameCount: AVAudioFramePosition,
+        inputSampleRate: Double
+    ) throws -> AVAudioFrameCount {
+        let lookahead = AVAudioFrameCount(resamplingLookaheadSampleCount)
+        let maximumConvertedFrameCount = AVAudioFrameCount.max - lookahead
+        let convertedFrameCount =
+            Double(sourceFrameCount) * outputSampleRate / inputSampleRate
+        guard sourceFrameCount >= 0,
+              inputSampleRate.isFinite,
+              inputSampleRate > 0,
+              convertedFrameCount.isFinite,
+              convertedFrameCount >= 0,
+              convertedFrameCount <= Double(maximumConvertedFrameCount) else {
+            throw DecodeError.frameCapacityOverflow(
+                sourceFrameCount: sourceFrameCount,
+                inputSampleRate: inputSampleRate
+            )
+        }
+        return AVAudioFrameCount(convertedFrameCount) + lookahead
+    }
+
+    private static func decodeBounded(
+        _ file: AVAudioFile,
+        maximumSampleCount: Int
+    ) throws -> BoundedDecode {
+        let (conversionSampleCount, conversionSampleCountOverflow) =
+            maximumSampleCount.addingReportingOverflow(
+                resamplingLookaheadSampleCount
+            )
+        guard maximumSampleCount > 0,
+              !conversionSampleCountOverflow,
+              conversionSampleCount <= Int(AVAudioFrameCount.max) else {
+            throw DecodeError.invalidMaximumSampleCount(maximumSampleCount)
+        }
+        let inFormat = file.processingFormat
+
+        // Already 16 kHz mono -> bounded direct PCM read, still bit-exact.
+        if inFormat.sampleRate == outputSampleRate, inFormat.channelCount == 1 {
+            let frameCount = min(
+                AVAudioFramePosition(maximumSampleCount),
+                file.length
+            )
+            guard let buffer = AVAudioPCMBuffer(
+                pcmFormat: inFormat,
+                frameCapacity: AVAudioFrameCount(frameCount)
+            ) else {
+                throw DecodeError.converter
+            }
+            try file.read(into: buffer, frameCount: AVAudioFrameCount(frameCount))
+            let count = Int(buffer.frameLength)
+            guard count > 0, let channels = buffer.floatChannelData else {
+                throw DecodeError.noData
+            }
+            return BoundedDecode(
+                samples: Array(UnsafeBufferPointer(start: channels[0], count: count)),
+                sourceFramesRead: AVAudioFramePosition(count)
+            )
+        }
+
+        guard let outFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: outputSampleRate,
+            channels: 1,
+            interleaved: false
+        ),
+        let converter = AVAudioConverter(from: inFormat, to: outFormat),
+        let outBuffer = AVAudioPCMBuffer(
+            pcmFormat: outFormat,
+            frameCapacity: AVAudioFrameCount(conversionSampleCount)
+        ) else {
+            throw DecodeError.converter
+        }
+        converter.primeMethod = .normal
+        let frameLimit = try sourceFrameLimit(
+            conversionOutputSampleCount: conversionSampleCount,
+            inputSampleRate: inFormat.sampleRate,
+            trailingFrames: converter.primeInfo.trailingFrames
+        )
+        let input = BoundedAudioConverterInput(
+            file: file,
+            frameLimit: min(file.length, frameLimit),
+            maximumChunkFrames: boundedInputChunkFrames
+        )
+        var conversionError: NSError?
+        let status = converter.convert(
+            to: outBuffer,
+            error: &conversionError
+        ) { packetCount, inputStatus in
+            input.next(
+                requestedPacketCount: packetCount,
+                status: inputStatus
+            )
+        }
+        if let readError = input.capturedError() { throw readError }
+        if let conversionError { throw conversionError }
+        guard status != .error else { throw DecodeError.noData }
+        let count = Int(outBuffer.frameLength)
+        guard count > 0, let channels = outBuffer.floatChannelData else {
+            throw DecodeError.noData
+        }
+        let returnedSampleCount = min(count, maximumSampleCount)
+        return BoundedDecode(
+            samples: Array(
+                UnsafeBufferPointer(
+                    start: channels[0],
+                    count: returnedSampleCount
+                )
+            ),
+            sourceFramesRead: input.suppliedFrames()
+        )
+    }
+
+    static func sourceFrameLimit(
+        conversionOutputSampleCount: Int,
+        inputSampleRate: Double,
+        trailingFrames: AVAudioFrameCount
+    ) throws -> AVAudioFramePosition {
+        guard conversionOutputSampleCount > 0,
+              inputSampleRate.isFinite,
+              inputSampleRate > 0 else {
+            throw DecodeError.invalidMaximumSampleCount(conversionOutputSampleCount)
+        }
+        let convertedFrameCount = (
+            Double(conversionOutputSampleCount) * inputSampleRate / outputSampleRate
+        ).rounded(.up)
+        let totalFrameCount = convertedFrameCount + Double(trailingFrames)
+        guard totalFrameCount.isFinite,
+              totalFrameCount <= Double(AVAudioFramePosition.max) else {
+            throw DecodeError.converter
+        }
+        return AVAudioFramePosition(totalFrameCount)
     }
 }
 
@@ -61,6 +258,89 @@ private final class AudioConverterInput: @unchecked Sendable {
         didFeed = true
         status.pointee = .haveData
         return buffer
+    }
+}
+
+private final class BoundedAudioConverterInput: @unchecked Sendable {
+    private let file: AVAudioFile
+    private let frameLimit: AVAudioFramePosition
+    private let maximumChunkFrames: AVAudioFrameCount
+    private let lock = NSLock()
+    private var suppliedFrameCount: AVAudioFramePosition = 0
+    private var readError: Error?
+
+    init(
+        file: AVAudioFile,
+        frameLimit: AVAudioFramePosition,
+        maximumChunkFrames: AVAudioFrameCount
+    ) {
+        self.file = file
+        self.frameLimit = frameLimit
+        self.maximumChunkFrames = maximumChunkFrames
+    }
+
+    func next(
+        requestedPacketCount: AVAudioPacketCount,
+        status: UnsafeMutablePointer<AVAudioConverterInputStatus>
+    ) -> AVAudioPCMBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard readError == nil else {
+            status.pointee = .endOfStream
+            return nil
+        }
+        let remainingFrameCount = frameLimit - suppliedFrameCount
+        guard remainingFrameCount > 0 else {
+            status.pointee = .endOfStream
+            return nil
+        }
+        let frameCount = min(
+            AVAudioFramePosition(requestedPacketCount),
+            remainingFrameCount,
+            AVAudioFramePosition(maximumChunkFrames)
+        )
+        guard frameCount > 0 else {
+            status.pointee = .noDataNow
+            return nil
+        }
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: file.processingFormat,
+            frameCapacity: AVAudioFrameCount(frameCount)
+        ) else {
+            readError = JinaAudioFile.DecodeError.converter
+            status.pointee = .endOfStream
+            return nil
+        }
+        do {
+            try file.read(
+                into: buffer,
+                frameCount: AVAudioFrameCount(frameCount)
+            )
+        } catch {
+            readError = error
+            status.pointee = .endOfStream
+            return nil
+        }
+        guard buffer.frameLength > 0 else {
+            status.pointee = .endOfStream
+            return nil
+        }
+        suppliedFrameCount += AVAudioFramePosition(buffer.frameLength)
+        status.pointee = .haveData
+        return buffer
+    }
+
+    func capturedError() -> Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return readError
+    }
+
+    func suppliedFrames() -> AVAudioFramePosition {
+        lock.lock()
+        defer { lock.unlock() }
+        return suppliedFrameCount
     }
 }
 
@@ -100,7 +380,18 @@ public final class JinaAudioEmbedderMasked: @unchecked Sendable {
     /// Audio file -> embedding (AVFoundation decode to 16 kHz mono, then `embed(_:)`). Exact for
     /// already-16 kHz-mono files; other rates carry the documented resample caveat. Clips >30 s truncate.
     public func embed(audioURL: URL, dim: Int? = nil) throws -> [Float] {
-        try embed(JinaAudioFile.decode16kMono(audioURL), dim: dim)
+        try embed(Self.decodeForEmbedding(audioURL).samples, dim: dim)
+    }
+
+    public static let maximumDecodedSampleCount = maxFrames * 160 + 400
+
+    typealias BoundedDecoder = (URL, Int) throws -> JinaAudioFile.BoundedDecode
+
+    static func decodeForEmbedding(
+        _ url: URL,
+        using decoder: BoundedDecoder = JinaAudioFile.decodeBounded
+    ) throws -> JinaAudioFile.BoundedDecode {
+        try decoder(url, maximumDecodedSampleCount)
     }
 
     /// 16 kHz mono waveform -> embedding. Exact reference parity for any length up to ~30 s.
@@ -120,7 +411,7 @@ public final class JinaAudioEmbedderMasked: @unchecked Sendable {
         let used = Array(full[0 ..< (L * 1024)])
         let ids = Self.prefix + Array(repeating: Self.audioPad, count: L) + Self.suffix
         let emb = try decoder.decode(tokenIds: ids, features: used, scatterOffset: Self.prefix.count)
-        if let d = dim { return matryoshka(emb, dim: d) }
+        if let d = dim { return try matryoshka(emb, dim: d) }
         return emb
     }
 }

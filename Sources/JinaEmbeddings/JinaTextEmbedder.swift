@@ -9,6 +9,8 @@ import Foundation
 ///  - multi-function model (`init(multiFunctionModelURL:...)`): functions `bucket_<S>` sharing
 ///    weights; the smallest fitting bucket is selected per text and lazily loaded.
 public final class JinaTextEmbedder: @unchecked Sendable {
+    private static let outputDimension = 1024
+
     public enum TextEmbedderError: Error {
         case noBucketsConfigured
         /// The text at this input position tokenized to nothing; embedding it is meaningless,
@@ -96,17 +98,19 @@ public final class JinaTextEmbedder: @unchecked Sendable {
 
     /// Embed text. `dim` truncates to a Matryoshka dimension (re-normalized); nil = full 1024.
     public func embed(_ text: String, prompt: Prompt = .none, dim: Int? = nil) throws -> [Float] {
+        try Self.validateRequestedDimension(dim)
         var ids = tokenizer.encode(prompt.rawValue + text)
         let (enc, bucket) = try encoder(forTokenCount: ids.count)
         if ids.count > bucket { ids = Array(ids.prefix(bucket)) }
         let full = try enc.encode(tokenIds: ids)
-        if let d = dim { return matryoshka(full, dim: d) }
+        if let d = dim { return try matryoshka(full, dim: d) }
         return full
     }
 
     /// Embed many texts, grouping them by sequence-length bucket so each bucket's texts run in
     /// one Core ML batch call. Vectors are returned in the input order.
     public func embed(batch texts: [String], prompt: Prompt = .none, dim: Int? = nil) throws -> [[Float]] {
+        try Self.validateRequestedDimension(dim)
         guard !texts.isEmpty else { return [] }
         var perBucket: [Int: [(index: Int, ids: [Int32])]] = [:]
         for (index, text) in texts.enumerated() {
@@ -124,10 +128,21 @@ public final class JinaTextEmbedder: @unchecked Sendable {
             let embeddings = try encoder.encode(batch: items.map(\.ids))
             for (offset, item) in items.enumerated() {
                 let full = embeddings[offset]
-                output[item.index] = dim.map { matryoshka(full, dim: $0) } ?? full
+                if let dim {
+                    output[item.index] = try matryoshka(full, dim: dim)
+                } else {
+                    output[item.index] = full
+                }
             }
         }
         return output
+    }
+
+    static func validateRequestedDimension(_ dim: Int?) throws {
+        guard let dim else { return }
+        guard (1...outputDimension).contains(dim) else {
+            throw MatryoshkaError.invalidDimension(requested: dim, available: outputDimension)
+        }
     }
 
     private func encoder(forBucket bucket: Int) throws -> CoreMLTextEncoder {

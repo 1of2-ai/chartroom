@@ -95,7 +95,7 @@ struct SchemaMigrationTests {
         _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
 
         let db = try SQLite(path: path)
-        #expect(try IndexStore.appliedSchemaVersion(db: db) == 2)
+        #expect(try IndexStore.appliedSchemaVersion(db: db) == 3)
 
         // The valid chain survived intact.
         #expect(try count(db, "SELECT COUNT(*) FROM chunks WHERE id='chunk-keep'") == 1)
@@ -151,17 +151,52 @@ struct SchemaMigrationTests {
         #expect(try count(db, "SELECT COUNT(*) FROM vectors") == 0)
     }
 
-    @Test("a store written by a newer build is refused rather than opened")
-    func newerStoreIsRefused() throws {
+    @Test("a store written by a newer build is refused before its schema is changed")
+    func newerStoreIsRefusedWithoutSchemaChanges() async throws {
         let path = temporaryStorePath("future")
         defer { try? FileManager.default.removeItem(atPath: path) }
 
         _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
         let db = try SQLite(path: path)
         try IndexStore.record(migration: 99, name: "from-the-future", db: db)
+        try db.exec("""
+        CREATE TABLE relations (id TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO relations VALUES('future-sentinel', 'must survive');
+        """)
+        let schemaVersionBeforeRefusal = try count(db, "PRAGMA schema_version")
 
         #expect(throws: IndexStoreSchemaError.self) {
             _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
+        }
+
+        do {
+            _ = try await IndexEngine.open(
+                storeURL: URL(fileURLWithPath: path),
+                configuration: .init(embedder: HashingEmbedder(dimension: 4))
+            )
+            Issue.record("Expected the engine facade to refuse a store from a newer build")
+        } catch let error as IndexEngineError {
+            #expect(error.category == .migrationRequired)
+            #expect(error.code == "index.open.newer-schema")
+            #expect(error.recoverability == .needsUserAction)
+        } catch {
+            Issue.record("Expected IndexEngineError, got \(type(of: error)): \(error)")
+        }
+
+        #expect(
+            try count(db, "PRAGMA schema_version") == schemaVersionBeforeRefusal,
+            "refusing a future store must execute no DDL"
+        )
+        let relationsSurvived = try count(
+            db,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='relations'"
+        ) == 1
+        #expect(relationsSurvived, "opening an unsupported schema must not drop future tables")
+        if relationsSurvived {
+            #expect(
+                try count(db, "SELECT COUNT(*) FROM relations WHERE id='future-sentinel'") == 1,
+                "opening an unsupported schema must not mutate future data"
+            )
         }
     }
 

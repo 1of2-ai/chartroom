@@ -104,14 +104,20 @@ public final class CoreMLTextEncoder: @unchecked Sendable {
     }
 }
 
+public enum MatryoshkaError: Error, Equatable, Sendable {
+    case invalidDimension(requested: Int, available: Int)
+}
+
 /// L2-normalized truncation for Matryoshka dims: `normalize(full[:dim])`.
-public func matryoshka(_ embedding: [Float], dim: Int) -> [Float] {
-    let d = min(dim, embedding.count)
-    var v = Array(embedding[0..<d])
+public func matryoshka(_ embedding: [Float], dim: Int) throws -> [Float] {
+    guard dim > 0, dim <= embedding.count else {
+        throw MatryoshkaError.invalidDimension(requested: dim, available: embedding.count)
+    }
+    var v = Array(embedding[0..<dim])
     var norm: Float = 0
     for x in v { norm += x * x }
     norm = max(norm.squareRoot(), 1e-12)
-    for i in 0..<d { v[i] /= norm }
+    for i in 0..<dim { v[i] /= norm }
     return v
 }
 

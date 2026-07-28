@@ -47,6 +47,8 @@ public actor IndexEngine: IndexEngineClient {
             return IndexEngine(store: store, storeURL: storeURL, configuration: resolvedConfiguration)
         } catch let error as IndexEngineError {
             throw error
+        } catch let error as IndexStoreSchemaError {
+            throw schemaOpenError(error)
         } catch {
             throw storageUnavailableError(
                 error,
@@ -71,6 +73,8 @@ public actor IndexEngine: IndexEngineClient {
             return IndexEngine(store: store, storeURL: nil, configuration: resolvedConfiguration)
         } catch let error as IndexEngineError {
             throw error
+        } catch let error as IndexStoreSchemaError {
+            throw schemaOpenError(error)
         } catch {
             throw storageUnavailableError(
                 error,
@@ -313,6 +317,27 @@ public actor IndexEngine: IndexEngineClient {
             summary: summary,
             detail: String(describing: error)
         )
+    }
+
+    private static func schemaOpenError(_ error: IndexStoreSchemaError) -> IndexEngineError {
+        switch error {
+        case .storeFromNewerBuild:
+            return IndexEngineError(
+                .migrationRequired,
+                code: "index.open.newer-schema",
+                recoverability: .needsUserAction,
+                summary: "This index requires a newer version of Chartroom.",
+                detail: String(describing: error)
+            )
+        case .referentialIntegrityCheckFailed:
+            return IndexEngineError(
+                .migrationFailed,
+                code: "index.open.migration-failed",
+                recoverability: .needsUserAction,
+                summary: "The index store could not be migrated safely.",
+                detail: String(describing: error)
+            )
+        }
     }
 
     /// Search the active index.

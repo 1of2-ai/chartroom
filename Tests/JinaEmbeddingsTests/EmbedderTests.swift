@@ -234,7 +234,7 @@ func visionPositionAndPatchifyPort() throws {
         #expect(maxAbs(pe, try f32("g\(g.tag)_pos_embeds.f32")) < 1e-4)
         #expect(maxAbs(cv, try f32("g\(g.tag)_rope_cos.f32")) < 1e-4)
         #expect(maxAbs(sv, try f32("g\(g.tag)_rope_sin.f32")) < 1e-4)
-        let (pv, _, _) = prep.pixelValues(rgb: try u8("g\(g.tag)_rgb.u8"), h: g.gh * 16, w: g.gw * 16)
+        let (pv, _, _) = try prep.pixelValues(rgb: u8("g\(g.tag)_rgb.u8"), h: g.gh * 16, w: g.gw * 16)
         #expect(maxAbs(pv, try f32("g\(g.tag)_pixel_values.f32")) < 1e-4)
     }
 }
@@ -554,6 +554,12 @@ func matryoshkaDimsAreUnitNorm() async throws {
     let embedder = try await JinaTextEmbedder(
         multiFunctionModelURL: path("artifacts/coreml/text_multifunc.mlpackage"),
         tokenizerFolder: path("artifacts/hf/jina-v5-omni-small"))
+    for invalidDimension in [-1, 0, 1025] {
+        #expect(throws: MatryoshkaError.self) {
+            _ = try embedder.embed(batch: [], dim: invalidDimension)
+        }
+    }
+    #expect(try embedder.embed(batch: [], dim: 1024).isEmpty)
     for d in [64, 256, 512] {
         let emb = try embedder.embed("semantic search", prompt: .query, dim: d)
         #expect(emb.count == d)

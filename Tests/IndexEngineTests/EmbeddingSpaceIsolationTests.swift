@@ -1,3 +1,4 @@
+import ChartroomTestSupport
 import Foundation
 import Testing
 @testable import IndexEngine
@@ -174,5 +175,264 @@ struct EmbeddingSpaceIsolationTests {
         #expect(response.hits.isEmpty)
         #expect(response.diagnostics.embeddingSpaceMismatch == false)
         #expect(try await store.embeddingSpaceCoverage().isOrphaned == false)
+    }
+
+    @Test("exact and FTS retrieval do not require an active-space embedding")
+    func lexicalRetrievalSurvivesEmbedderSwap() async throws {
+        let path = temporaryStorePath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let original = try IndexStore(
+            path: path,
+            embedder: HashingEmbedder(modelID: "model-alpha", dimension: 64)
+        )
+        try await original.upsert(.init(
+            id: "doc-lexical",
+            type: "note",
+            title: "Needle Exact Title",
+            body: "a bodyonlymarker that the full text index can retrieve"
+        ))
+
+        let swapped = try IndexStore(
+            path: path,
+            embedder: HashingEmbedder(modelID: "model-beta", dimension: 64)
+        )
+        let exactOnly = RetrievalProfile(
+            id: "exact-only-test",
+            version: 1,
+            maxFTSCandidates: 0,
+            maxVectorCandidates: 0,
+            maxSnippets: 10
+        )
+        let exact = try await swapped.searchDetailed(
+            "Needle Exact Title",
+            limit: 5,
+            profile: exactOnly
+        )
+        #expect(exact.hits.map(\.documentID) == ["doc-lexical"])
+        #expect(exact.hits.first?.exactRank == 1)
+        #expect(exact.hits.first?.embeddingSpaceID == nil)
+
+        let ftsOnly = RetrievalProfile(
+            id: "fts-only-test",
+            version: 1,
+            maxFTSCandidates: 10,
+            maxVectorCandidates: 0,
+            maxSnippets: 0
+        )
+        let fts = try await swapped.searchDetailed(
+            "bodyonlymarker",
+            limit: 5,
+            profile: ftsOnly
+        )
+        #expect(fts.hits.map(\.documentID) == ["doc-lexical"])
+        #expect(fts.hits.first?.keywordRank == 1)
+        #expect(fts.hits.first?.embeddingSpaceID == nil)
+    }
+
+    @Test("a foreign-space filter degrades to lexical retrieval without querying the active embedder")
+    func foreignSpaceFilterSkipsActiveVectorScoring() async throws {
+        let path = temporaryStorePath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let recorder = QueryEmbedRecorder()
+        let alpha = try IndexStore(
+            path: path,
+            embedder: QueryRecordingEmbedder(modelID: "model-alpha", recorder: recorder)
+        )
+        try await alpha.upsert(document())
+        let beta = try IndexStore(
+            path: path,
+            embedder: HashingEmbedder(modelID: "model-beta", dimension: 64)
+        )
+        try await beta.upsert(document())
+
+        let response = try await alpha.searchDetailed(
+            "thermal throttling",
+            filters: .init(embeddingSpaceID: "model-beta:64"),
+            limit: 5,
+            allowDegradedResults: true
+        )
+
+        #expect(response.hits.map(\.documentID) == ["doc-1"])
+        #expect(response.hits.first?.embeddingSpaceID == "model-beta:64")
+        #expect(response.hits.first?.vectorRank == nil)
+        #expect(response.diagnostics.degraded)
+        #expect(response.diagnostics.missingChannels == [.vector])
+        #expect(await recorder.queryCount == 0)
+    }
+
+    @Test("strict search rejects an orphaned active embedding space")
+    func strictSearchRejectsOrphanedActiveSpace() async throws {
+        let path = temporaryStorePath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let original = try IndexStore(
+            path: path,
+            embedder: HashingEmbedder(modelID: "model-alpha", dimension: 64)
+        )
+        try await original.upsert(document())
+
+        let engine = try await IndexEngine.open(
+            storeURL: URL(filePath: path),
+            configuration: .init(embedder: HashingEmbedder(modelID: "model-beta", dimension: 64))
+        )
+        do {
+            _ = try await engine.search(.init(
+                query: "thermal throttling",
+                allowDegradedResults: false
+            ))
+            Issue.record("Expected strict search against an orphaned active space to throw")
+        } catch let error as IndexEngineError {
+            #expect(error.category == .embeddingSpaceUnavailable)
+            #expect(error.code == "index.search.embedding-space-mismatch")
+        }
+    }
+
+    @Test("embedding-space filters do not multiply lexical candidate ranks")
+    func embeddingSpaceFiltersDoNotDuplicateLexicalRanks() async throws {
+        let path = temporaryStorePath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let store = try IndexStore(
+            path: path,
+            embedder: HashingEmbedder(modelID: "model-alpha", dimension: 64)
+        )
+        try await store.upsert(.init(
+            id: "doc-duplicate",
+            type: "note",
+            title: "Needle Exact Title",
+            body: "bodyonlymarker for filtered full text retrieval"
+        ))
+
+        let db = try SQLite(path: path)
+        try db.exec("""
+        INSERT INTO embeddings(
+          id,chunk_id,embedding_space_id,model_id,model_version,dimension,modality,prompt_kind,
+          vector_backend_id,vector_backend_version,vector_hash,created_at
+        )
+        SELECT id || ':duplicate',chunk_id,embedding_space_id,model_id,model_version,dimension,
+          modality,prompt_kind,vector_backend_id,vector_backend_version,vector_hash,created_at
+        FROM embeddings
+        LIMIT 1;
+        """)
+        let filter = SearchFilters(embeddingSpaceID: "model-alpha:64")
+
+        let exact = try await store.searchDetailed(
+            "Needle Exact Title",
+            filters: filter,
+            limit: 5,
+            profile: .init(
+                id: "exact-filter-test",
+                version: 1,
+                maxFTSCandidates: 0,
+                maxVectorCandidates: 0,
+                maxSnippets: 5
+            )
+        )
+        #expect(exact.hits.count == 1)
+        #expect(exact.hits.first?.exactRank == 1)
+
+        let fts = try await store.searchDetailed(
+            "bodyonlymarker",
+            filters: filter,
+            limit: 5,
+            profile: .init(
+                id: "fts-filter-test",
+                version: 1,
+                maxFTSCandidates: 5,
+                maxVectorCandidates: 0,
+                maxSnippets: 0
+            )
+        )
+        #expect(fts.hits.count == 1)
+        #expect(fts.hits.first?.keywordRank == 1)
+    }
+
+    @Test("strict foreign-space search returns the typed engine mismatch")
+    func strictForeignSpaceSearchThrowsTypedMismatch() async throws {
+        let path = temporaryStorePath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let recorder = QueryEmbedRecorder()
+        let alpha = try IndexStore(
+            path: path,
+            embedder: QueryRecordingEmbedder(modelID: "model-alpha", recorder: recorder)
+        )
+        try await alpha.upsert(document())
+        let beta = try IndexStore(
+            path: path,
+            embedder: HashingEmbedder(modelID: "model-beta", dimension: 64)
+        )
+        try await beta.upsert(document())
+
+        let engine = try await IndexEngine.open(
+            storeURL: URL(filePath: path),
+            configuration: .init(embedder: QueryRecordingEmbedder(modelID: "model-alpha", recorder: recorder))
+        )
+        do {
+            _ = try await engine.search(.init(
+                query: "thermal throttling",
+                filters: .init(embeddingSpaceID: "model-beta:64"),
+                allowDegradedResults: false
+            ))
+            Issue.record("Expected strict search across a foreign embedding space to throw")
+        } catch let error as IndexEngineError {
+            #expect(error.category == .embeddingSpaceUnavailable)
+            #expect(error.code == "index.search.embedding-space-mismatch")
+        }
+        #expect(await recorder.queryCount == 0)
+    }
+
+    @Test("upsert rejects an object that claims a foreign embedding space")
+    func upsertRejectsForeignSpaceClaim() async throws {
+        let store = try IndexStore(
+            path: ":memory:",
+            embedder: HashingEmbedder(modelID: "model-alpha", dimension: 64)
+        )
+        let object = IndexedObject(
+            id: "lying-object",
+            type: "note",
+            title: "Mismatch",
+            body: "this object claims vectors from another space",
+            embeddingSpaceID: "model-beta:64"
+        )
+
+        do {
+            try await store.upsert(object)
+            Issue.record("Expected a foreign embedding-space claim to be rejected")
+        } catch let error as IndexStoreError {
+            #expect(
+                error == .embeddingSpaceMismatch(
+                    expected: "model-alpha:64",
+                    actual: "model-beta:64"
+                )
+            )
+        } catch {
+            Issue.record("Expected IndexStoreError, got \(type(of: error)): \(error)")
+        }
+        #expect(try await store.counts().documentCount == 0)
+        #expect(try await store.counts().embeddingCount == 0)
+    }
+}
+
+private actor QueryEmbedRecorder {
+    private(set) var queryCount = 0
+
+    func recordQuery() {
+        queryCount += 1
+    }
+}
+
+private struct QueryRecordingEmbedder: FixtureEmbedder {
+    let modelID: String
+    let dimension = 64
+    let recorder: QueryEmbedRecorder
+
+    func embed(_ text: String, kind: EmbedKind) async throws -> [Float] {
+        if kind == .query {
+            await recorder.recordQuery()
+        }
+        return [Float](repeating: 1 / 8, count: dimension)
     }
 }

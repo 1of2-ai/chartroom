@@ -142,6 +142,14 @@ extension IndexStore {
     }
 
     public func upsert(_ obj: IndexedObject) async throws {
+        if let claimedEmbeddingSpaceID = obj.embeddingSpaceID,
+           claimedEmbeddingSpaceID != embeddingSpaceID {
+            throw IndexStoreError.embeddingSpaceMismatch(
+                expected: embeddingSpaceID,
+                actual: claimedEmbeddingSpaceID
+            )
+        }
+
         let normalizedBody = Self.normalizedText(obj.body)
         let policyID = obj.policyID ?? IngestionPolicy.default.id.rawValue
         let policyVersion = IngestionPolicy.default.version
@@ -163,7 +171,8 @@ extension IndexStore {
         )
 
         let imageURL = imageEmbeddingSource(for: obj)
-        let upsertGeneration = nextUpsertGeneration(for: obj.id)
+        let mutationToken = try beginDocumentMutation(for: obj.id)
+        defer { try? clearDocumentMutation(mutationToken, for: obj.id) }
 
         // Compute one vector per chunk. Text documents embed all chunks in a single batch so the
         // embedder can group them by bucket and run them together; image documents embed the file
@@ -195,10 +204,9 @@ extension IndexStore {
             )
         }
 
-        guard isCurrentUpsertGeneration(upsertGeneration, for: obj.id) else { return }
-
         let now = Date.now.timeIntervalSince1970
         try db.transaction {
+            guard try self.isCurrentDocumentMutation(mutationToken, for: obj.id) else { return }
             try self.persistObjectProjection(obj, now: now, embeddingSpaceID: activeEmbeddingSpaceID)
             try self.persistSource(id: sourceID, sourceURI: sourceURI, now: now)
             try self.persistDocument(
@@ -252,14 +260,19 @@ extension IndexStore {
                 activeEmbeddingSpaceID: activeEmbeddingSpaceID,
                 now: now
             )
+            try self.clearDocumentMutation(mutationToken, for: obj.id)
         }
     }
 
     @discardableResult
     public func delete(id: String) throws -> Bool {
-        guard try activeDocumentExists(id: id) else { return false }
         let now = Date.now.timeIntervalSince1970
-        try db.transaction {
+        return try db.transaction {
+            let mutationToken = try beginDocumentMutation(for: id)
+            guard try activeDocumentExists(id: id) else {
+                try clearDocumentMutation(mutationToken, for: id)
+                return false
+            }
             try removeChunkRecords(documentID: id)
 
             let document = try db.prepare("""
@@ -278,8 +291,9 @@ extension IndexStore {
                 statement.bind(1, id)
                 try statement.step()
             }
+            try clearDocumentMutation(mutationToken, for: id)
+            return true
         }
-        return true
     }
 
     public func persistPolicy(_ policy: IngestionPolicy, resolutions: [PolicyResolution]) throws {
@@ -742,14 +756,37 @@ extension IndexStore {
         try statement.step()
     }
 
-    private func nextUpsertGeneration(for documentID: String) -> UInt64 {
-        let next = (upsertGenerations[documentID] ?? 0) &+ 1
-        upsertGenerations[documentID] = next
-        return next
+    /// Records ordering at the SQLite boundary shared by every `IndexStore` opened on this file.
+    /// The final write checks the token inside its transaction, so a delete either wins before
+    /// persistence or runs after it and removes the committed document.
+    private func beginDocumentMutation(for documentID: String) throws -> String {
+        let token = UUID().uuidString
+        let statement = try db.prepare("""
+        INSERT INTO document_mutations(document_id,token) VALUES(?1,?2)
+        ON CONFLICT(document_id) DO UPDATE SET token=excluded.token
+        """)
+        statement.bind(1, documentID)
+        statement.bind(2, token)
+        try statement.step()
+        return token
     }
 
-    private func isCurrentUpsertGeneration(_ generation: UInt64, for documentID: String) -> Bool {
-        upsertGenerations[documentID] == generation
+    private func isCurrentDocumentMutation(_ token: String, for documentID: String) throws -> Bool {
+        let statement = try db.prepare("""
+        SELECT 1 FROM document_mutations WHERE document_id = ?1 AND token = ?2 LIMIT 1
+        """)
+        statement.bind(1, documentID)
+        statement.bind(2, token)
+        return try statement.step()
+    }
+
+    private func clearDocumentMutation(_ token: String, for documentID: String) throws {
+        let statement = try db.prepare("""
+        DELETE FROM document_mutations WHERE document_id = ?1 AND token = ?2
+        """)
+        statement.bind(1, documentID)
+        statement.bind(2, token)
+        try statement.step()
     }
 
     /// The local image file to embed for this object, or nil to use the text path. Images

@@ -40,7 +40,8 @@ extension IndexStore {
     ///
     /// v1 — durable retrieval core.
     /// v2 — foreign keys across the document → chunk → embedding → vector chain.
-    static let supportedSchemaVersion = 2
+    /// v3 — cross-connection document mutation ordering.
+    static let supportedSchemaVersion = 3
 
     static func record(migration version: Int, name: String, db: SQLite) throws {
         let statement = try db.prepare("""
@@ -317,7 +318,10 @@ extension IndexStore {
           name TEXT NOT NULL,
           applied_at REAL NOT NULL
         );
+        """)
+        try refuseStoreFromNewerBuild(db: db)
 
+        try db.exec("""
         CREATE TABLE IF NOT EXISTS sources (
           id TEXT PRIMARY KEY,
           connector_kind TEXT NOT NULL,
@@ -351,6 +355,11 @@ extension IndexStore {
           permission_scope_id TEXT NOT NULL DEFAULT '',
           provenance TEXT NOT NULL DEFAULT '{}',
           cluster_id TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS document_mutations (
+          document_id TEXT PRIMARY KEY,
+          token TEXT NOT NULL
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -491,7 +500,7 @@ extension IndexStore {
 
         try record(migration: 1, name: "durable-retrieval-core", db: db)
         try migrateToReferentialIntegrity(db: db)
-        try refuseStoreFromNewerBuild(db: db)
+        try record(migration: 3, name: "document-mutation-ordering", db: db)
 
         let backend = try db.prepare("""
         INSERT INTO vector_backend_metadata(id,version,state,message,updated_at)

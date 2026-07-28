@@ -106,12 +106,15 @@ public struct IndexStoreCounts: Sendable, Equatable {
 
 public enum IndexStoreError: Error, CustomStringConvertible, Equatable {
     case embeddingDimensionMismatch(kind: EmbedKind, expected: Int, actual: Int)
+    case embeddingSpaceMismatch(expected: String, actual: String)
     case storedVectorDimensionMismatch(id: String, expected: Int, actual: Int)
 
     public var description: String {
         switch self {
         case let .embeddingDimensionMismatch(kind, expected, actual):
             "Embedding dimension mismatch for \(kind): expected \(expected), got \(actual)"
+        case let .embeddingSpaceMismatch(expected, actual):
+            "Embedding space mismatch: expected \(expected), got \(actual)"
         case let .storedVectorDimensionMismatch(id, expected, actual):
             "Stored vector dimension mismatch for \(id): expected \(expected), got \(actual)"
         }
@@ -135,7 +138,6 @@ public actor IndexStore {
     public let vectorBackendID = EngineID.builtInSQLiteVectorBackend.rawValue
     public let vectorBackendVersion = "1"
 
-    var upsertGenerations: [String: UInt64] = [:]
     /// Confirmed-available probe result; see `embeddingProviderStatus()`.
     var cachedEmbeddingProviderStatus: (isAvailable: Bool, message: String)?
     /// The `k` constant in the reciprocal-rank-fusion weight `1 / (k + rank)`. Public so the
