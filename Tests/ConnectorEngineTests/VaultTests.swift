@@ -68,6 +68,35 @@ struct VaultTests {
         #expect(hits.first?.title == "Thermal")
     }
 
+    @Test("an unreadable subtree records a failure instead of silently dropping notes")
+    func unreadableSubtreeRecordsFailure() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("vault-locked-\(UUID().uuidString)")
+        let locked = dir.appendingPathComponent("Locked")
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: locked.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        try "# Open\nreadable note".write(to: dir.appendingPathComponent("open.md"), atomically: true, encoding: .utf8)
+        try "# Hidden\nunreachable note".write(to: locked.appendingPathComponent("hidden.md"), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: Int16(0o000))], ofItemAtPath: locked.path)
+
+        let store = try IndexStore(path: ":memory:", embedder: HashingEmbedder(dimension: 256))
+        let count = try await store.ingestVault(at: dir)
+        #expect(count == 1)
+
+        // The positive count alone must not read as a complete vault: the
+        // unreadable subtree is recorded, not silently dropped.
+        let failures = try await store.failureSnapshots(limit: 10)
+        let subtree = try #require(
+            failures.first { $0.detail.contains("Locked") || $0.message.contains("Locked") },
+            "no failure recorded for the unreadable subtree"
+        )
+        let category: FailureSnapshot.Category = subtree.category
+        #expect(category == .sourceUnavailable || category == .permissionDenied)
+    }
+
     @Test("bad vault files record failures without aborting the walk")
     func badVaultFilesRecordFailuresWithoutAborting() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("vault-bad-\(UUID().uuidString)")

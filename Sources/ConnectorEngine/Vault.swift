@@ -268,20 +268,39 @@ public enum Vault {
         (((path as NSString).lastPathComponent) as NSString).deletingPathExtension
     }
 
+    /// A vault walk's result: the files to ingest, plus every path the walk could
+    /// not inspect. Policy skips (symlinks, oversize, out-of-root) are not failures
+    /// — they are silent by design — but an error is never one of them.
+    struct Scan {
+        var files: [URL] = []
+        var failures: [(path: String, reason: String)] = []
+    }
+
     /// All `.md` files under `directory`, gathered synchronously (the directory
     /// enumerator's iterator is unavailable from async contexts).
     static func markdownFiles(in directory: URL) -> [URL] {
-        guard let root = try? VaultFileReader.canonicalURL(for: directory) else { return [] }
+        scanMarkdown(in: directory).files
+    }
+
+    static func scanMarkdown(in directory: URL) -> Scan {
+        var scan = Scan()
+        guard let root = try? VaultFileReader.canonicalURL(for: directory) else {
+            scan.failures.append((directory.path, "The vault root could not be resolved."))
+            return scan
+        }
         guard let walker = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: Array(inspectionKeys),
             options: [.skipsHiddenFiles, .skipsPackageDescendants],
-            errorHandler: { _, _ in true }
+            errorHandler: { url, error in
+                scan.failures.append((url.path, error.localizedDescription))
+                return true
+            }
         ) else {
-            return []
+            scan.failures.append((root.path, "The vault directory could not be enumerated."))
+            return scan
         }
 
-        var out: [URL] = []
         while let object = walker.nextObject() {
             guard let url = object as? URL, url.pathExtension.lowercased() == "md" else {
                 continue
@@ -291,6 +310,11 @@ public enum Vault {
             do {
                 values = try url.resourceValues(forKeys: inspectionKeys)
             } catch {
+                // Vanished mid-walk is a deletion, not a failure; anything else is
+                // a file the vault claims to have but cannot describe.
+                if FileManager.default.fileExists(atPath: url.path) {
+                    scan.failures.append((url.path, error.localizedDescription))
+                }
                 continue
             }
             guard values.isSymbolicLink != true,
@@ -301,12 +325,13 @@ public enum Vault {
             }
 
             guard let resolvedURL = try? VaultFileReader.canonicalURL(for: url) else {
+                scan.failures.append((url.path, "The file path could not be resolved."))
                 continue
             }
             guard contains(resolvedURL, within: root) else { continue }
-            out.append(resolvedURL)
+            scan.files.append(resolvedURL)
         }
-        return out
+        return scan
     }
 
     private static func contains(_ url: URL, within root: URL) -> Bool {
@@ -326,8 +351,25 @@ public extension IndexStore {
     @discardableResult
     func ingestVault(at directory: URL) async throws -> Int {
         let reader = try VaultFileReader(rootURL: directory)
+        let scan = Vault.scanMarkdown(in: reader.rootURL)
+        // A partial walk must be visible: every path the scan could not inspect is
+        // recorded, so a positive count never silently means "minus the notes the
+        // walk lost". Mirrors the loud policy readMarkdown failures already follow.
+        for failure in scan.failures {
+            try recordFailure(
+                FailureSnapshot(
+                    id: EngineID(rawValue: UUID().uuidString),
+                    category: .sourceUnavailable,
+                    message: "Could not scan vault path \(failure.path)",
+                    detail: failure.reason,
+                    documentID: EngineID(rawValue: failure.path),
+                    recoverability: .needsUserAction,
+                    occurredAt: Date.now
+                )
+            )
+        }
         var count = 0
-        for url in Vault.markdownFiles(in: reader.rootURL) {
+        for url in scan.files {
             let rel = (try? reader.relativePath(for: url)) ?? url.lastPathComponent
             let text: String
             do {
