@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import IndexEngine
 import Testing
@@ -5,6 +6,8 @@ import Testing
 
 @Suite("ConnectorEngine contracts")
 struct ConnectorEngineTests {
+    private struct ScanCheckpointCancellation: Error {}
+
     @Test("connectors emit IndexEngine payloads without owning indexing")
     func connectorEmitsEnginePayloads() async throws {
         let connector = FixtureConnector()
@@ -93,6 +96,35 @@ struct ConnectorEngineTests {
         #expect(changedPayload.documentID == "local-test:Notes/Retrieval.md")
     }
 
+    @Test("local file scanning checks cancellation between directory entries")
+    func localFileScanningChecksCancellationBetweenEntries() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "local-connector-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for index in 0..<5 {
+            try "entry \(index)".write(
+                to: root.appending(path: "\(index).md"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        let connector = LocalFileConnector(rootURL: root, id: "local-test")
+        var checkpointCount = 0
+
+        #expect(throws: ScanCheckpointCancellation.self) {
+            _ = try connector.scanPayloads {
+                checkpointCount += 1
+                if checkpointCount == 3 {
+                    throw ScanCheckpointCancellation()
+                }
+            }
+        }
+        #expect(checkpointCount == 3)
+    }
+
     @Test("local file connector emits deletes for files removed since the prior cursor")
     func localFileConnectorEmitsDeletesForRemovedFiles() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: "local-connector-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -179,6 +211,62 @@ struct ConnectorEngineTests {
             return payload.documentID
         }
         #expect(upsertedIDs == ["local-test:Changed.md"])
+    }
+
+    @Test("local file connector detects same-size rewrites whose mtime is restored")
+    func localFileConnectorDetectsPreservedMtimeRewrite() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "local-connector-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let noteURL = root.appending(path: "Restored.md")
+        try Data("alpha".utf8).write(to: noteURL)
+        let connector = LocalFileConnector(
+            rootURL: root,
+            id: "local-test",
+            options: LocalFileConnectorOptions(allowedPathExtensions: ["md"])
+        )
+
+        var initialEvents: [SourceEvent] = []
+        for try await event in try await connector.changes(since: nil) {
+            initialEvents.append(event)
+        }
+        guard case let .checkpoint(cursor) = initialEvents.last else {
+            Issue.record("Expected an initial checkpoint")
+            return
+        }
+
+        var before = stat()
+        #expect(Darwin.lstat(noteURL.path, &before) == 0)
+        try await Task.sleep(for: .milliseconds(20))
+        try Data("bravo".utf8).write(to: noteURL)
+        let originalTimes = [before.st_atimespec, before.st_mtimespec]
+        let restoreResult = originalTimes.withUnsafeBufferPointer { times in
+            Darwin.utimensat(AT_FDCWD, noteURL.path, times.baseAddress, 0)
+        }
+        #expect(restoreResult == 0)
+
+        var after = stat()
+        #expect(Darwin.lstat(noteURL.path, &after) == 0)
+        #expect(after.st_size == before.st_size)
+        #expect(after.st_mtimespec.tv_sec == before.st_mtimespec.tv_sec)
+        #expect(after.st_mtimespec.tv_nsec == before.st_mtimespec.tv_nsec)
+        #expect(
+            after.st_ctimespec.tv_sec != before.st_ctimespec.tv_sec
+                || after.st_ctimespec.tv_nsec != before.st_ctimespec.tv_nsec
+        )
+
+        var restoredEvents: [SourceEvent] = []
+        for try await event in try await connector.changes(since: cursor) {
+            restoredEvents.append(event)
+        }
+
+        let upsertedIDs = restoredEvents.compactMap { event -> DocumentID? in
+            guard case let .upsert(payload) = event else { return nil }
+            return payload.documentID
+        }
+        #expect(upsertedIDs == ["local-test:Restored.md"])
     }
 
     @Test("local file connector rejects undecodable cursors instead of silently disabling deletes")
@@ -355,6 +443,68 @@ struct ConnectorEngineTests {
         })
         guard case .checkpoint = events.last else {
             Issue.record("Expected a checkpoint after the degraded sync")
+            return
+        }
+    }
+
+    @Test("an unreadable root shields every indexed file instead of purging the source")
+    func localFileConnectorShieldsUnreadableRoot() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "local-connector-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let subdirectory = root.appending(path: "Notes", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: subdirectory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: root.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        try "top".write(to: root.appending(path: "Top.md"), atomically: true, encoding: .utf8)
+        try "nested".write(to: subdirectory.appending(path: "Nested.md"), atomically: true, encoding: .utf8)
+
+        let connector = LocalFileConnector(
+            rootURL: root,
+            id: "local-test",
+            options: LocalFileConnectorOptions(allowedPathExtensions: ["md"])
+        )
+        var initialEvents: [SourceEvent] = []
+        for try await event in try await connector.changes(since: nil) {
+            initialEvents.append(event)
+        }
+        guard case let .checkpoint(cursor) = initialEvents.last else {
+            Issue.record("Expected an initial checkpoint")
+            return
+        }
+
+        // The whole root becomes unreadable — an unmounted volume or revoked
+        // permission. This is the worst case shielding exists for: nothing may
+        // be deleted.
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: Int16(0o000))], ofItemAtPath: root.path)
+
+        var shieldedEvents: [SourceEvent] = []
+        for try await event in try await connector.changes(since: cursor) {
+            shieldedEvents.append(event)
+        }
+        #expect(!shieldedEvents.contains { event in
+            if case .delete = event { return true }
+            return false
+        })
+        #expect(shieldedEvents.contains(.permissionChanged(documentID: "local-test:Top.md")))
+        #expect(shieldedEvents.contains(.permissionChanged(documentID: "local-test:Notes/Nested.md")))
+        guard case let .checkpoint(shieldedCursor) = shieldedEvents.last else {
+            Issue.record("Expected a checkpoint after the shielded sync")
+            return
+        }
+
+        // Once the root is readable again the carried fingerprints mean unchanged
+        // files are neither deleted nor re-upserted.
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: root.path)
+
+        var restoredEvents: [SourceEvent] = []
+        for try await event in try await connector.changes(since: shieldedCursor) {
+            restoredEvents.append(event)
+        }
+        #expect(restoredEvents.count == 1)
+        guard case .checkpoint = restoredEvents.last else {
+            Issue.record("Expected only a checkpoint after the root became readable again")
             return
         }
     }

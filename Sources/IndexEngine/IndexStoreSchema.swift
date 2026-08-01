@@ -41,7 +41,9 @@ extension IndexStore {
     /// v1 — durable retrieval core.
     /// v2 — foreign keys across the document → chunk → embedding → vector chain.
     /// v3 — cross-connection document mutation ordering.
-    static let supportedSchemaVersion = 3
+    /// v4 — current chunk embedding modality ownership.
+    /// v5 — removal of full-text rows whose chunks no longer exist.
+    static let supportedSchemaVersion = 5
 
     static func record(migration version: Int, name: String, db: SQLite) throws {
         let statement = try db.prepare("""
@@ -109,10 +111,19 @@ extension IndexStore {
         do {
             try db.transaction {
                 // Orphans first: these are rows the old schema allowed and the new one forbids.
+                // Parents before children — deleting a chunk orphans its embeddings, and deleting
+                // an embedding orphans its vector, so each delete must run after the one that
+                // creates its orphans or a transitive chain survives to fail the integrity check.
+                // (chunks_fts goes first: it needs the doomed chunks still present to find them.)
                 try db.exec("""
-                DELETE FROM vectors WHERE id NOT IN (SELECT id FROM embeddings);
-                DELETE FROM embeddings WHERE chunk_id NOT IN (SELECT id FROM chunks);
+                DELETE FROM chunks_fts
+                  WHERE chunk_id IN (
+                    SELECT id FROM chunks
+                    WHERE document_id NOT IN (SELECT id FROM documents)
+                  );
                 DELETE FROM chunks WHERE document_id NOT IN (SELECT id FROM documents);
+                DELETE FROM embeddings WHERE chunk_id NOT IN (SELECT id FROM chunks);
+                DELETE FROM vectors WHERE id NOT IN (SELECT id FROM embeddings);
                 DELETE FROM representations WHERE document_id NOT IN (SELECT id FROM documents);
                 DELETE FROM representation_lineages WHERE document_id NOT IN (SELECT id FROM documents);
                 DELETE FROM document_versions WHERE document_id NOT IN (SELECT id FROM documents);
@@ -131,19 +142,36 @@ extension IndexStore {
                 CREATE INDEX IF NOT EXISTS idx_embeddings_chunk ON embeddings(chunk_id);
                 """)
 
+                // Ask SQLite itself rather than trusting the rebuild — and ask before the
+                // migration is recorded, inside the transaction: a surviving violation must
+                // roll the whole rebuild back so the next open retries it, not durably mark
+                // the store as migrated while still violating what the schema now claims.
+                let check = try db.prepare("PRAGMA foreign_key_check")
+                if try check.step() {
+                    let table = check.text(0) ?? "unknown"
+                    let parent = check.text(2) ?? "unknown"
+                    throw IndexStoreSchemaError.referentialIntegrityCheckFailed(
+                        detail: "\(table) references a missing row in \(parent)"
+                    )
+                }
+
                 try record(migration: 2, name: "referential-integrity", db: db)
             }
         }
+    }
 
-        // Ask SQLite itself rather than trusting the rebuild: a surviving violation means the
-        // store is not what the schema now claims, and the caller must hear that at open.
-        let check = try db.prepare("PRAGMA foreign_key_check")
-        if try check.step() {
-            let table = check.text(0) ?? "unknown"
-            let parent = check.text(2) ?? "unknown"
-            throw IndexStoreSchemaError.referentialIntegrityCheckFailed(
-                detail: "\(table) references a missing row in \(parent)"
-            )
+    private static func migrateToFullTextIntegrity(db: SQLite) throws {
+        guard try appliedSchemaVersion(db: db) < 5 else { return }
+
+        try db.transaction {
+            try db.exec("""
+            DELETE FROM chunks_fts
+            WHERE NOT EXISTS (
+              SELECT 1 FROM chunks
+              WHERE chunks.id = chunks_fts.chunk_id
+            );
+            """)
+            try record(migration: 5, name: "full-text-integrity", db: db)
         }
     }
 
@@ -267,7 +295,8 @@ extension IndexStore {
           content_hash TEXT NOT NULL,
           active INTEGER NOT NULL,
           availability_state TEXT NOT NULL,
-          created_at REAL NOT NULL
+          created_at REAL NOT NULL,
+          embedding_modality TEXT NOT NULL DEFAULT 'text'
         """,
         "embeddings": """
           id TEXT PRIMARY KEY,
@@ -470,6 +499,28 @@ extension IndexStore {
         // reports "unknown" rather than inventing a line range.
         try ensureIndexStoreColumn(db: db, table: "chunks", name: "line_start", definition: "line_start INTEGER")
         try ensureIndexStoreColumn(db: db, table: "chunks", name: "line_end", definition: "line_end INTEGER")
+        let needsChunkModalityMigration = try appliedSchemaVersion(db: db) < 4
+        try ensureIndexStoreColumn(
+            db: db,
+            table: "chunks",
+            name: "embedding_modality",
+            definition: "embedding_modality TEXT NOT NULL DEFAULT 'text'"
+        )
+        if needsChunkModalityMigration {
+            // Before v4 modality lived only on embeddings. Use the newest write as the migration
+            // source, then let the chunk own this state from here forward. The migration-version
+            // gate makes this retry-safe if an earlier launch added the column but stopped before
+            // completing the backfill.
+            try db.exec("""
+            UPDATE chunks
+            SET embedding_modality = COALESCE((
+              SELECT modality FROM embeddings
+              WHERE embeddings.chunk_id = chunks.id
+              ORDER BY embeddings.created_at DESC, embeddings.id DESC
+              LIMIT 1
+            ), 'text');
+            """)
+        }
         try ensureIndexStoreColumn(db: db, table: "jobs", name: "kind", definition: "kind TEXT NOT NULL DEFAULT 'ingest'")
         try ensureIndexStoreColumn(db: db, table: "failures", name: "source_uri", definition: "source_uri TEXT")
         let addedRecoverabilityColumn = try ensureIndexStoreColumn(
@@ -501,6 +552,8 @@ extension IndexStore {
         try record(migration: 1, name: "durable-retrieval-core", db: db)
         try migrateToReferentialIntegrity(db: db)
         try record(migration: 3, name: "document-mutation-ordering", db: db)
+        try record(migration: 4, name: "chunk-embedding-modality", db: db)
+        try migrateToFullTextIntegrity(db: db)
 
         let backend = try db.prepare("""
         INSERT INTO vector_backend_metadata(id,version,state,message,updated_at)

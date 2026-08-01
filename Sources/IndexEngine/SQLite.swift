@@ -19,8 +19,25 @@ public struct SQLiteError: Error, CustomStringConvertible {
 final class SQLite {
     let handle: OpaquePointer
     let path: String
+    private var statementPreparationObserver: (@Sendable (String) -> Void)?
 
-    init(path: String) throws {
+    convenience init(path: String) throws {
+        try self.init(path: path) { handle in
+            let timeoutRC = sqlite3_busy_timeout(handle, 5_000)
+            guard timeoutRC == SQLITE_OK else {
+                throw SQLiteError(code: timeoutRC, message: String(cString: sqlite3_errmsg(handle)))
+            }
+            try Self.exec("PRAGMA journal_mode=WAL", on: handle)
+            try Self.exec("PRAGMA foreign_keys=ON", on: handle)
+        }
+    }
+
+    /// Opens a handle and transfers its ownership to `self` only after configuration succeeds.
+    ///
+    /// The injected configuration seam keeps the failure path observable in tests. More
+    /// importantly, it makes the ownership boundary explicit: any error before assignment closes
+    /// the raw handle here, because `deinit` cannot run for an incompletely initialized instance.
+    init(path: String, configure: (OpaquePointer) throws -> Void) throws {
         self.path = path
         var h: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
@@ -30,13 +47,13 @@ final class SQLite {
             if let h { sqlite3_close_v2(h) }
             throw SQLiteError(code: rc, message: msg)
         }
-        handle = h
-        let timeoutRC = sqlite3_busy_timeout(handle, 5_000)
-        guard timeoutRC == SQLITE_OK else {
-            throw SQLiteError(code: timeoutRC, message: String(cString: sqlite3_errmsg(handle)))
+        do {
+            try configure(h)
+        } catch {
+            sqlite3_close_v2(h)
+            throw error
         }
-        try exec("PRAGMA journal_mode=WAL")
-        try exec("PRAGMA foreign_keys=ON")
+        handle = h
     }
 
     deinit { sqlite3_close_v2(handle) }
@@ -55,6 +72,10 @@ final class SQLite {
     }
 
     func exec(_ sql: String) throws {
+        try Self.exec(sql, on: handle)
+    }
+
+    private static func exec(_ sql: String, on handle: OpaquePointer) throws {
         var err: UnsafeMutablePointer<CChar>?
         let rc = sqlite3_exec(handle, sql, nil, nil, &err)
         if rc != SQLITE_OK {
@@ -82,7 +103,14 @@ final class SQLite {
         guard rc == SQLITE_OK, let stmt else {
             throw SQLiteError(code: rc, message: String(cString: sqlite3_errmsg(handle)))
         }
+        statementPreparationObserver?(sql)
         return Statement(stmt: stmt, db: handle)
+    }
+
+    /// Internal instrumentation used by focused query-shape tests. The callback runs on the
+    /// connection's owning actor once per successful statement preparation.
+    func observeStatementPreparations(_ observer: (@Sendable (String) -> Void)?) {
+        statementPreparationObserver = observer
     }
 }
 
@@ -98,7 +126,10 @@ final class Statement {
     /// what a `precondition` here did — is not an option a library gets to take.
     private var bindFailure: SQLiteError?
 
-    init(stmt: OpaquePointer, db: OpaquePointer) { self.stmt = stmt; self.db = db }
+    init(stmt: OpaquePointer, db: OpaquePointer) {
+        self.stmt = stmt
+        self.db = db
+    }
     deinit { sqlite3_finalize(stmt) }
 
     func bind(_ i: Int32, _ text: String) { checkBind(sqlite3_bind_text(stmt, i, text, -1, sqliteTransient())) }

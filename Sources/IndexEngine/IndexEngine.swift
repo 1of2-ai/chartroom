@@ -492,16 +492,62 @@ public actor IndexEngine: IndexEngineClient {
         }
     }
 
+    /// Best-effort compatibility projection. Use `diagnosticHistory(limit:)` when the caller
+    /// needs to distinguish an empty history from an unavailable durable table.
     public func failures(limit: Int = 50) async -> [FailureSnapshot] {
-        guard limit > 0 else { return [] }
-        let durableFailures = (try? await store.failureSnapshots(limit: limit + recentFailures.count)) ?? []
-        return Self.mergedFailures(durableFailures, recentFailures: recentFailures, limit: limit)
+        await diagnosticHistory(limit: limit).failures
     }
 
+    /// Best-effort compatibility projection. Use `diagnosticHistory(limit:)` for completeness.
     public func jobs(limit: Int = 50) async -> [JobSnapshot] {
-        guard limit > 0 else { return [] }
-        let durableJobs = (try? await store.jobSnapshots(limit: limit + recentJobs.count)) ?? []
-        return Self.mergedJobs(durableJobs, recentJobs: recentJobs, limit: limit)
+        await diagnosticHistory(limit: limit).jobs
+    }
+
+    /// Reads durable jobs and failures independently so one damaged table cannot erase the other
+    /// channel's history. Process-local recents remain available when a durable read fails, but the
+    /// availability fields make that partial result explicit.
+    public func diagnosticHistory(limit: Int = 50) async -> DiagnosticHistory {
+        let requestedLimit = max(0, limit)
+        var jobsAvailability = DiagnosticHistoryAvailability.available
+        var failuresAvailability = DiagnosticHistoryAvailability.available
+        let durableJobs: [JobSnapshot]
+        let durableFailures: [FailureSnapshot]
+
+        do {
+            durableJobs = try await store.jobSnapshots(
+                limit: max(1, requestedLimit + recentJobs.count)
+            )
+        } catch {
+            durableJobs = []
+            jobsAvailability = .unavailable
+        }
+        do {
+            durableFailures = try await store.failureSnapshots(
+                limit: max(1, requestedLimit + recentFailures.count)
+            )
+        } catch {
+            durableFailures = []
+            failuresAvailability = .unavailable
+        }
+
+        return DiagnosticHistory(
+            jobs: requestedLimit == 0
+                ? []
+                : Self.mergedJobs(
+                    durableJobs,
+                    recentJobs: recentJobs,
+                    limit: requestedLimit
+                ),
+            failures: requestedLimit == 0
+                ? []
+                : Self.mergedFailures(
+                    durableFailures,
+                    recentFailures: recentFailures,
+                    limit: requestedLimit
+                ),
+            jobsAvailability: jobsAvailability,
+            failuresAvailability: failuresAvailability
+        )
     }
 
     /// Report the embedding provider's health *and* what kind of provider it is.
@@ -607,11 +653,11 @@ public actor IndexEngine: IndexEngineClient {
     public func clearFailures(ids: Set<EngineID>? = nil) async throws {
         if let ids {
             let rawIDs = Set(ids.map(\.rawValue))
-            recentFailures.removeAll { rawIDs.contains($0.id.rawValue) }
             try await store.deleteFailures(ids: rawIDs)
+            recentFailures.removeAll { rawIDs.contains($0.id.rawValue) }
         } else {
-            recentFailures.removeAll()
             try await store.deleteFailures(ids: nil)
+            recentFailures.removeAll()
         }
     }
 

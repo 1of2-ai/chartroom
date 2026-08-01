@@ -111,10 +111,14 @@ extension IndexStore {
             try db.prepare("DELETE FROM failures").step()
             return
         }
-        for id in ids {
+        guard !ids.isEmpty else { return }
+        try db.transaction {
             let statement = try db.prepare("DELETE FROM failures WHERE id = ?1")
-            statement.bind(1, id)
-            try statement.step()
+            for id in ids.sorted() {
+                statement.reset()
+                statement.bind(1, id)
+                try statement.step()
+            }
         }
     }
 

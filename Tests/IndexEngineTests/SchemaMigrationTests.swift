@@ -38,6 +38,9 @@ struct SchemaMigrationTests {
           content_hash TEXT NOT NULL, active INTEGER NOT NULL, availability_state TEXT NOT NULL,
           created_at REAL NOT NULL
         );
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+          text, title, path, heading_path, chunk_id UNINDEXED
+        );
         CREATE TABLE embeddings (
           id TEXT PRIMARY KEY, chunk_id TEXT NOT NULL, embedding_space_id TEXT NOT NULL, model_id TEXT NOT NULL,
           model_version TEXT NOT NULL, dimension INTEGER NOT NULL, modality TEXT NOT NULL,
@@ -68,13 +71,17 @@ struct SchemaMigrationTests {
           10,0,0,0,0,0,'','{}','');
         INSERT INTO chunks VALUES('chunk-keep','doc-keep','v1','rep','lin',0,'chunker','1','default',1,
           'kept text','','','',0,9,0,9,0,1,1,1,0,0,'','chash',1,'chunkTextAvailable',0);
-        INSERT INTO embeddings VALUES('emb-keep','chunk-keep','space','model','1',4,'text','document',
+        INSERT INTO chunks_fts(text,title,path,heading_path,chunk_id)
+          VALUES('kept text','Keep','/keep','','chunk-keep');
+        INSERT INTO embeddings VALUES('emb-keep','chunk-keep','space','model','1',4,'image','document',
           'backend','1','vhash',0);
         INSERT INTO vectors VALUES('emb-keep',4,X'00000000000000000000000000000000');
 
         -- Orphans the unenforced schema permitted, each a row the constraints now forbid.
         INSERT INTO chunks VALUES('chunk-orphan','doc-missing','v1','rep','lin',0,'chunker','1','default',1,
           'orphan','','','',0,6,0,6,0,1,1,1,0,0,'','chash',1,'chunkTextAvailable',0);
+        INSERT INTO chunks_fts(text,title,path,heading_path,chunk_id)
+          VALUES('orphan','Orphan','/orphan','','chunk-orphan');
         INSERT INTO embeddings VALUES('emb-orphan','chunk-missing','space','model','1',4,'text','document',
           'backend','1','vhash',0);
         INSERT INTO vectors VALUES('vec-orphan',4,X'00000000000000000000000000000000');
@@ -95,15 +102,23 @@ struct SchemaMigrationTests {
         _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
 
         let db = try SQLite(path: path)
-        #expect(try IndexStore.appliedSchemaVersion(db: db) == 3)
+        #expect(try IndexStore.appliedSchemaVersion(db: db) == IndexStore.supportedSchemaVersion)
 
         // The valid chain survived intact.
         #expect(try count(db, "SELECT COUNT(*) FROM chunks WHERE id='chunk-keep'") == 1)
+        #expect(try count(db, "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id='chunk-keep'") == 1)
+        #expect(
+            try count(
+                db,
+                "SELECT COUNT(*) FROM chunks WHERE id='chunk-keep' AND embedding_modality='image'"
+            ) == 1
+        )
         #expect(try count(db, "SELECT COUNT(*) FROM embeddings WHERE id='emb-keep'") == 1)
         #expect(try count(db, "SELECT COUNT(*) FROM vectors WHERE id='emb-keep'") == 1)
 
         // The orphans the old schema allowed are gone.
         #expect(try count(db, "SELECT COUNT(*) FROM chunks WHERE id='chunk-orphan'") == 0)
+        #expect(try count(db, "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id='chunk-orphan'") == 0)
         #expect(try count(db, "SELECT COUNT(*) FROM embeddings WHERE id='emb-orphan'") == 0)
         #expect(try count(db, "SELECT COUNT(*) FROM vectors WHERE id='vec-orphan'") == 0)
 
@@ -116,6 +131,120 @@ struct SchemaMigrationTests {
         }
         let check = try db.prepare("PRAGMA foreign_key_check")
         #expect(try check.step() == false)
+    }
+
+    @Test("a transitive orphan chain is fully cleaned by the v2 migration")
+    func migrationCleansTransitiveOrphanChain() throws {
+        let path = temporaryStorePath("legacy-v1-chain")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try makeLegacyStore(at: path)
+
+        // A chain the old cleanup order missed: the chunk's document is gone, but the
+        // embedding's chunk and the vector's embedding both exist — until the chunk
+        // delete runs, at which point child-first cleanup has already passed them by.
+        let db = try SQLite(path: path)
+        try db.exec("""
+        INSERT INTO chunks VALUES('chunk-chain','doc-gone','v1','rep','lin',0,'chunker','1','default',1,
+          'chained','','','',0,7,0,7,0,1,1,1,0,0,'','chash',1,'chunkTextAvailable',0);
+        INSERT INTO embeddings VALUES('emb-chain','chunk-chain','space','model','1',4,'text','document',
+          'backend','1','vhash',0);
+        INSERT INTO vectors VALUES('emb-chain',4,X'00000000000000000000000000000000');
+        """)
+
+        _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
+
+        let migrated = try SQLite(path: path)
+        #expect(try count(migrated, "SELECT COUNT(*) FROM chunks WHERE id='chunk-chain'") == 0)
+        #expect(try count(migrated, "SELECT COUNT(*) FROM embeddings WHERE id='emb-chain'") == 0)
+        #expect(try count(migrated, "SELECT COUNT(*) FROM vectors WHERE id='emb-chain'") == 0)
+        #expect(try count(migrated, "SELECT COUNT(*) FROM chunks WHERE id='chunk-keep'") == 1)
+        #expect(try count(migrated, "SELECT COUNT(*) FROM embeddings WHERE id='emb-keep'") == 1)
+        let check = try migrated.prepare("PRAGMA foreign_key_check")
+        #expect(try check.step() == false)
+    }
+
+    @Test("the modality backfill resumes when the column exists but migration v4 is incomplete")
+    func modalityBackfillResumesAfterInterruptedMigration() throws {
+        let path = temporaryStorePath("interrupted-v4")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try makeLegacyStore(at: path)
+
+        _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
+
+        let interruptedStore = try SQLite(path: path)
+        try interruptedStore.exec("""
+        UPDATE chunks SET embedding_modality='text' WHERE id='chunk-keep';
+        DELETE FROM schema_migrations WHERE version >= 4;
+        """)
+        #expect(try IndexStore.appliedSchemaVersion(db: interruptedStore) == 3)
+        #expect(
+            try count(
+                interruptedStore,
+                "SELECT COUNT(*) FROM chunks WHERE id='chunk-keep' AND embedding_modality='text'"
+            ) == 1
+        )
+
+        _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
+
+        let migratedStore = try SQLite(path: path)
+        #expect(try IndexStore.appliedSchemaVersion(db: migratedStore) == 5)
+        #expect(
+            try count(
+                migratedStore,
+                "SELECT COUNT(*) FROM chunks WHERE id='chunk-keep' AND embedding_modality='image'"
+            ) == 1
+        )
+    }
+
+    @Test("a v4 store removes stale FTS rows without deleting live entries")
+    func alreadyMigratedStoreRepairsOrphanedFullTextRows() throws {
+        let path = temporaryStorePath("stale-fts-v4")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
+
+        let v4Store = try SQLite(path: path)
+        try v4Store.exec("""
+        DELETE FROM schema_migrations WHERE version > 4;
+        INSERT INTO documents(
+          id, source_id, source_uri, external_id, content_hash, version, active_version_id,
+          title, content_type, file_extension, size, created_at, modified_at, ingested_at,
+          updated_at, is_deleted, permission_scope_id, provenance, cluster_id
+        ) VALUES(
+          'doc-live', 'src', 'file:///live', 'ext', 'hash', 1, 'v1',
+          'Live', 'text/plain', 'txt', 9, 0, 0, 0, 0, 0, '', '{}', ''
+        );
+        INSERT INTO chunks(
+          id, document_id, document_version_id, representation_id, representation_lineage_id,
+          ordinal, chunker_id, chunker_version, policy_id, policy_version, text, context_prefix,
+          context_suffix, heading_path, byte_start, byte_end, character_start, character_end,
+          token_start, token_end, line_start, line_end, page_start, page_end, section_label,
+          content_hash, active, availability_state, created_at, embedding_modality
+        ) VALUES(
+          'chunk-live', 'doc-live', 'v1', 'rep', 'lin',
+          0, 'chunker', '1', 'default', 1, 'live text', '',
+          '', '', 0, 9, 0, 9,
+          0, 1, 1, 1, 0, 0, '',
+          'chunk-hash', 1, 'chunkTextAvailable', 0, 'text'
+        );
+        INSERT INTO chunks_fts(text, title, path, heading_path, chunk_id)
+          VALUES('live text', 'Live', '/live', '', 'chunk-live');
+        INSERT INTO chunks_fts(text, title, path, heading_path, chunk_id)
+          VALUES('stale text', 'Stale', '/stale', '', 'chunk-missing');
+        """)
+        #expect(try IndexStore.appliedSchemaVersion(db: v4Store) == 4)
+        #expect(try count(v4Store, "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id='chunk-live'") == 1)
+        #expect(try count(v4Store, "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id='chunk-missing'") == 1)
+
+        _ = try IndexStore(path: path, embedder: HashingEmbedder(dimension: 4))
+
+        let repairedStore = try SQLite(path: path)
+        #expect(try IndexStore.appliedSchemaVersion(db: repairedStore) == 5)
+        #expect(
+            try count(repairedStore, "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id='chunk-live'") == 1
+        )
+        #expect(
+            try count(repairedStore, "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id='chunk-missing'") == 0
+        )
     }
 
     /// The constraints have to be live, not merely declared — that was the whole defect.

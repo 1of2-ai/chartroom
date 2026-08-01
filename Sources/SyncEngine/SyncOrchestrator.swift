@@ -37,7 +37,7 @@ public struct SyncOutcome: Sendable {
     public var ingestFailed: Int
     public var deletedCount: Int
     public var deleteFailed: Int
-    /// True when the run was stopped through its `SyncControl` before completing.
+    /// True when control stopped the run or task cancellation was observed at a sync checkpoint.
     public var stopped: Bool
     /// The checkpoint the store advanced to, or nil when the cursor was held back.
     public var newCursor: SourceCursor?
@@ -62,6 +62,11 @@ public struct SyncOutcome: Sendable {
 public struct SyncOrchestrator: Sendable {
     public typealias ProgressHandler = @Sendable (SyncProgressUpdate) async -> Void
 
+    private enum CollectionResult: Sendable {
+        case events([SourceEvent])
+        case stopped
+    }
+
     private let engine: any IndexEngineClient
     private let cursorStore: any CursorStore
 
@@ -82,8 +87,37 @@ public struct SyncOrchestrator: Sendable {
     ) async throws -> SyncOutcome {
         let startedAt = Date.now
 
-        try await connector.validate()
-        let stream = try await connector.changes(since: cursorStore.cursor(forKey: cursorKey))
+        if Task.isCancelled || control?.isStopping == true {
+            return stoppedOutcome(startedAt: startedAt)
+        }
+        guard try await racingStop(control, { try await connector.validate() }) != nil else {
+            return stoppedOutcome(startedAt: startedAt)
+        }
+        if Task.isCancelled || control?.isStopping == true {
+            return stoppedOutcome(startedAt: startedAt)
+        }
+        let cursor = cursorStore.cursor(forKey: cursorKey)
+        guard let stream = try await racingStop(control, { try await connector.changes(since: cursor) }) else {
+            return stoppedOutcome(startedAt: startedAt)
+        }
+        if Task.isCancelled || control?.isStopping == true {
+            return stoppedOutcome(startedAt: startedAt)
+        }
+
+        let collectedEvents: [SourceEvent]
+        do {
+            switch try await collectEvents(from: stream, control: control) {
+            case let .events(events):
+                collectedEvents = events
+            case .stopped:
+                return stoppedOutcome(startedAt: startedAt)
+            }
+        } catch let error as CancellationError {
+            guard Task.isCancelled || control?.isStopping == true else {
+                throw error
+            }
+            return stoppedOutcome(startedAt: startedAt)
+        }
 
         var payloads: [SourcePayload] = []
         var deletedDocumentIDs: [DocumentID] = []
@@ -92,7 +126,7 @@ public struct SyncOrchestrator: Sendable {
         var events: [SourceEvent] = []
         var pendingCursor: SourceCursor?
 
-        for try await event in stream {
+        for event in collectedEvents {
             events.append(event)
 
             switch event {
@@ -116,6 +150,20 @@ public struct SyncOrchestrator: Sendable {
         let uniqueDeletedDocumentIDs = Array(Set(deletedDocumentIDs)).sorted { $0.rawValue < $1.rawValue }
         let uniqueUnreadablePaths = Array(Set(unreadablePaths)).sorted()
         let unreadableKeptCount = Set(unreadableDocumentIDs).count
+
+        if let control {
+            await control.waitWhilePaused()
+        }
+        if Task.isCancelled || control?.isStopping == true {
+            return stoppedOutcome(
+                startedAt: startedAt,
+                events: events,
+                payloadCount: payloads.count,
+                hadChanges: !payloads.isEmpty || !uniqueDeletedDocumentIDs.isEmpty,
+                unreadablePaths: uniqueUnreadablePaths,
+                unreadableKeptCount: unreadableKeptCount
+            )
+        }
 
         guard !payloads.isEmpty || !uniqueDeletedDocumentIDs.isEmpty else {
             var newCursor: SourceCursor?
@@ -190,9 +238,13 @@ public struct SyncOrchestrator: Sendable {
         var stopped = false
 
         for payload in payloads {
+            if Task.isCancelled {
+                stopped = true
+                break
+            }
             if let control {
                 await control.waitWhilePaused()
-                if control.isStopping {
+                if Task.isCancelled || control.isStopping {
                     stopped = true
                     break
                 }
@@ -224,7 +276,7 @@ public struct SyncOrchestrator: Sendable {
             ))
         }
 
-        if !stopped, let control, control.isStopping {
+        if !stopped, Task.isCancelled || control?.isStopping == true {
             stopped = true
         }
 
@@ -232,6 +284,111 @@ public struct SyncOrchestrator: Sendable {
             accepted: accepted,
             failed: failed,
             stopped: stopped,
+            startedAt: startedAt,
+            finishedAt: .now
+        )
+    }
+
+    /// Runs one connector call racing the stop signal, returning nil when stop wins.
+    ///
+    /// Not a task group: a group awaits its children after cancellation, so a connector
+    /// that ignores cancellation while hung in `validate()` or `changes(since:)` would
+    /// hold the group — and the stop it was meant to honor — hostage. The losing task is
+    /// cancelled and abandoned instead; it finishes whenever the connector returns and
+    /// its result is discarded. A leaked task bounded by connector behavior is the price
+    /// of `stop()` always meaning stop.
+    private func racingStop<T: Sendable>(
+        _ control: SyncControl?,
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T? {
+        guard let control else { return try await operation() }
+
+        let (stream, continuation) = AsyncStream<Result<T, Error>?>.makeStream()
+        let operationTask = Task {
+            do {
+                continuation.yield(.success(try await operation()))
+            } catch {
+                continuation.yield(.failure(error))
+            }
+        }
+        let stopTask = Task {
+            await control.waitUntilStopping()
+            continuation.yield(nil)
+        }
+        defer {
+            operationTask.cancel()
+            stopTask.cancel()
+            continuation.finish()
+        }
+
+        for await first in stream {
+            switch first {
+            case let .success(value):
+                return value
+            case let .failure(error):
+                throw error
+            case nil:
+                return nil
+            }
+        }
+        return nil
+    }
+
+    private func collectEvents(
+        from stream: AsyncThrowingStream<SourceEvent, Error>,
+        control: SyncControl?
+    ) async throws -> CollectionResult {
+        guard let control else {
+            return try await Self.consume(stream)
+        }
+
+        return try await withThrowingTaskGroup(of: CollectionResult.self) { group in
+            group.addTask {
+                try await Self.consume(stream)
+            }
+            group.addTask {
+                await control.waitUntilStopping()
+                return .stopped
+            }
+
+            guard let first = try await group.next() else {
+                return .stopped
+            }
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private static func consume(
+        _ stream: AsyncThrowingStream<SourceEvent, Error>
+    ) async throws -> CollectionResult {
+        var events: [SourceEvent] = []
+        for try await event in stream {
+            events.append(event)
+        }
+        return Task.isCancelled ? .stopped : .events(events)
+    }
+
+    private func stoppedOutcome(
+        startedAt: Date,
+        events: [SourceEvent] = [],
+        payloadCount: Int = 0,
+        hadChanges: Bool = false,
+        unreadablePaths: [String] = [],
+        unreadableKeptCount: Int = 0
+    ) -> SyncOutcome {
+        SyncOutcome(
+            payloadCount: payloadCount,
+            accepted: 0,
+            ingestFailed: 0,
+            deletedCount: 0,
+            deleteFailed: 0,
+            stopped: true,
+            newCursor: nil,
+            hadChanges: hadChanges,
+            events: events,
+            unreadablePaths: unreadablePaths,
+            unreadableKeptCount: unreadableKeptCount,
             startedAt: startedAt,
             finishedAt: .now
         )

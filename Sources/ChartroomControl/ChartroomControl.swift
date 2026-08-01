@@ -7,6 +7,73 @@ private enum ChartroomSessionOperationContext {
     @TaskLocal static var sessionID: UUID?
 }
 
+private final class CursorKeySyncCoordinator: @unchecked Sendable {
+    private struct Waiter {
+        var id: UUID
+        var continuation: CheckedContinuation<Bool, Never>
+    }
+
+    private let lock = NSLock()
+    private var activeKeys: Set<String> = []
+    private var waiters: [String: [Waiter]] = [:]
+
+    func acquire(_ key: String) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        let waiterID = UUID()
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let immediateResult: Bool? = lock.withLock {
+                    guard !Task.isCancelled else { return false }
+                    if activeKeys.insert(key).inserted {
+                        return true
+                    }
+                    waiters[key, default: []].append(
+                        Waiter(id: waiterID, continuation: continuation)
+                    )
+                    return nil
+                }
+                if let immediateResult {
+                    continuation.resume(returning: immediateResult)
+                }
+            }
+        } onCancel: {
+            let continuation: CheckedContinuation<Bool, Never>? = lock.withLock {
+                guard var queued = waiters[key],
+                      let index = queued.firstIndex(where: { $0.id == waiterID })
+                else {
+                    return nil
+                }
+                let continuation = queued.remove(at: index).continuation
+                if queued.isEmpty {
+                    waiters.removeValue(forKey: key)
+                } else {
+                    waiters[key] = queued
+                }
+                return continuation
+            }
+            continuation?.resume(returning: false)
+        }
+    }
+
+    func release(_ key: String) {
+        let continuation: CheckedContinuation<Bool, Never>? = lock.withLock {
+            guard var queued = waiters[key], !queued.isEmpty else {
+                activeKeys.remove(key)
+                return nil
+            }
+            let continuation = queued.removeFirst().continuation
+            if queued.isEmpty {
+                waiters.removeValue(forKey: key)
+            } else {
+                waiters[key] = queued
+            }
+            return continuation
+        }
+        continuation?.resume(returning: true)
+    }
+}
+
 public enum ChartroomSessionState: String, Codable, Hashable, Sendable {
     case unopened
     case opening
@@ -21,6 +88,7 @@ public struct ChartroomStatus: Codable, Sendable {
     public var snapshot: IndexEngineSnapshot?
     public var health: IndexHealthSnapshot?
     public var modelStatus: ModelStatusSnapshot?
+    public var diagnosticHistory: DiagnosticHistory?
     public var jobs: [JobSnapshot]
     public var failures: [FailureSnapshot]
     public var lastError: String?
@@ -40,6 +108,7 @@ public struct ChartroomStatus: Codable, Sendable {
         self.snapshot = snapshot
         self.health = health
         self.modelStatus = modelStatus
+        self.diagnosticHistory = nil
         self.jobs = jobs
         self.failures = failures
         self.lastError = lastError
@@ -57,16 +126,27 @@ public actor ChartroomSession {
 
     private let engineFactory: EngineFactory
     private let cursorStore: any CursorStore
+    private let syncCoordinator = CursorKeySyncCoordinator()
     private var state: ChartroomSessionState = .unopened
     private var engine: (any IndexEngineClient)?
     private var storeURL: URL?
     private var lastSearch: SearchResponse?
     private var lastError: String?
+    private struct QuiescenceWaiter {
+        /// Whether a pending `open()` keeps this waiter suspended. `invalidateAndWait`
+        /// waits for everything; `close()` must not — an open never touches the engine
+        /// being retired, and a factory that ignores cancellation would deadlock it.
+        var includesOpens: Bool
+        var continuation: CheckedContinuation<Void, Never>
+    }
+
     private var isInvalidated = false
     private var activeOperationCount = 0
-    private var quiescenceWaiters: [CheckedContinuation<Void, Never>] = []
+    private var activeOpenCount = 0
+    private var quiescenceWaiters: [QuiescenceWaiter] = []
     private var lifecycleGeneration: UInt64 = 0
     private var pendingOpen: PendingOpen?
+    private var activeSyncControls: [UUID: SyncControl] = [:]
     private nonisolated let operationContextID = UUID()
 
     public init(engineFactory: @escaping EngineFactory, cursorStore: any CursorStore) {
@@ -76,7 +156,8 @@ public actor ChartroomSession {
 
     public func open() async throws -> ChartroomStatus {
         try beginOperation()
-        defer { endOperation() }
+        activeOpenCount += 1
+        defer { endOperation(isOpen: true) }
 
         return try await withOperationContext {
             if state == .ready {
@@ -139,8 +220,21 @@ public actor ChartroomSession {
     /// Releases the current engine instance. The next `open()` rebuilds it through this
     /// session's factory, which lets a host apply a changed model configuration without
     /// constructing an engine outside the product command surface.
-    public func close() {
+    ///
+    /// Cancel-then-drain: in-flight syncs are stopped (including ones running under a
+    /// caller-supplied `SyncControl`) and every active operation finishes before this
+    /// returns, so no work started under the old configuration can write after a reopen.
+    /// The non-terminal sibling of `invalidateAndWait`.
+    public func close() async throws {
         guard !isInvalidated else { return }
+        guard !isOperationActiveOnCurrentTask() else {
+            throw IndexEngineError(
+                .configurationInvalid,
+                code: "chartroom.session.close-inside-operation",
+                recoverability: .needsConfiguration,
+                summary: "The session cannot be closed from inside one of its own operations."
+            )
+        }
         lifecycleGeneration &+= 1
         pendingOpen?.task.cancel()
         pendingOpen = nil
@@ -149,6 +243,11 @@ public actor ChartroomSession {
         lastSearch = nil
         lastError = nil
         state = .unopened
+
+        for control in activeSyncControls.values {
+            control.stop()
+        }
+        await awaitQuiescence(includingOpens: false)
     }
 
     public func status(limit: Int = 1_000) async -> ChartroomStatus {
@@ -171,11 +270,7 @@ public actor ChartroomSession {
         state = .invalidated
         lastError = invalidatedError().summary
 
-        if activeOperationCount > 0 {
-            await withCheckedContinuation { continuation in
-                quiescenceWaiters.append(continuation)
-            }
-        }
+        await awaitQuiescence(includingOpens: true)
 
         engine = nil
         storeURL = nil
@@ -262,8 +357,10 @@ public actor ChartroomSession {
         try beginOperation()
         defer { endOperation() }
         return try await withOperationContext {
-            let orchestrator = SyncOrchestrator(engine: try requiredEngine(), cursorStore: cursorStore)
-            return await orchestrator.ingest(payloads: payloads, control: control, onProgress: onProgress)
+            try await withRegisteredSyncControl(control) { control in
+                let orchestrator = SyncOrchestrator(engine: try requiredEngine(), cursorStore: cursorStore)
+                return await orchestrator.ingest(payloads: payloads, control: control, onProgress: onProgress)
+            }
         }
     }
 
@@ -284,19 +381,22 @@ public actor ChartroomSession {
         }
     }
 
+    /// Best-effort compatibility projection. Use `diagnosticHistory(limit:)` when durable
+    /// completeness matters.
     public func failures(limit: Int = 1_000) async throws -> [FailureSnapshot] {
-        try beginOperation()
-        defer { endOperation() }
-        return try await withOperationContext {
-            try await requiredEngine().failures(limit: limit)
-        }
+        try await diagnosticHistory(limit: limit).failures
     }
 
+    /// Best-effort compatibility projection. Use `diagnosticHistory(limit:)` for completeness.
     public func jobs(limit: Int = 1_000) async throws -> [JobSnapshot] {
+        try await diagnosticHistory(limit: limit).jobs
+    }
+
+    public func diagnosticHistory(limit: Int = 1_000) async throws -> DiagnosticHistory {
         try beginOperation()
         defer { endOperation() }
         return try await withOperationContext {
-            try await requiredEngine().jobs(limit: limit)
+            try await requiredEngine().diagnosticHistory(limit: limit)
         }
     }
 
@@ -343,13 +443,45 @@ public actor ChartroomSession {
         control: SyncControl?,
         onProgress: SyncOrchestrator.ProgressHandler?
     ) async throws -> SyncOutcome {
-        let orchestrator = SyncOrchestrator(engine: try requiredEngine(), cursorStore: cursorStore)
-        return try await orchestrator.sync(
-            connector: connector,
-            cursorKey: cursorKey,
-            control: control,
-            onProgress: onProgress
-        )
+        try await withRegisteredSyncControl(control) { control in
+            let acquired = await syncCoordinator.acquire(cursorKey)
+            guard acquired else {
+                // `acquire` returns false only when this task is already cancelled, and
+                // cancellation is sticky, so the orchestrator's first check returns a
+                // stopped outcome before any connector or cursor work — the fall-through
+                // never runs a sync outside the per-key serialization.
+                let orchestrator = SyncOrchestrator(engine: try requiredEngine(), cursorStore: cursorStore)
+                return try await orchestrator.sync(
+                    connector: connector,
+                    cursorKey: cursorKey,
+                    control: control,
+                    onProgress: onProgress
+                )
+            }
+            defer { syncCoordinator.release(cursorKey) }
+
+            let orchestrator = SyncOrchestrator(engine: try requiredEngine(), cursorStore: cursorStore)
+            return try await orchestrator.sync(
+                connector: connector,
+                cursorKey: cursorKey,
+                control: control,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    /// Every sync runs under a control the session can reach: the caller's when supplied,
+    /// a session-created one otherwise. `close()` stops whatever is registered, which is
+    /// how in-flight work observes the lifecycle without the session owning its task.
+    private func withRegisteredSyncControl<T>(
+        _ control: SyncControl?,
+        operation: (SyncControl) async throws -> T
+    ) async rethrows -> T {
+        let effective = control ?? SyncControl()
+        let token = UUID()
+        activeSyncControls[token] = effective
+        defer { activeSyncControls.removeValue(forKey: token) }
+        return try await operation(effective)
     }
 
     private func currentStatus(limit: Int = 1_000) async -> ChartroomStatus {
@@ -357,16 +489,19 @@ public actor ChartroomSession {
             return ChartroomStatus(state: state, storeURL: storeURL, lastError: lastError)
         }
 
-        return await ChartroomStatus(
+        let diagnosticHistory = await engine.diagnosticHistory(limit: limit)
+        var status = await ChartroomStatus(
             state: state,
             storeURL: storeURL,
             snapshot: engine.snapshot(),
             health: engine.health(),
             modelStatus: engine.modelStatus(),
-            jobs: engine.jobs(limit: limit),
-            failures: engine.failures(limit: limit),
+            jobs: diagnosticHistory.jobs,
+            failures: diagnosticHistory.failures,
             lastError: lastError
         )
+        status.diagnosticHistory = diagnosticHistory
+        return status
     }
 
     private func currentStatus(
@@ -390,15 +525,37 @@ public actor ChartroomSession {
         activeOperationCount += 1
     }
 
-    private func endOperation() {
+    private func endOperation(isOpen: Bool = false) {
         precondition(activeOperationCount > 0)
         activeOperationCount -= 1
-        guard activeOperationCount == 0 else { return }
+        if isOpen {
+            precondition(activeOpenCount > 0)
+            activeOpenCount -= 1
+        }
 
-        let waiters = quiescenceWaiters
-        quiescenceWaiters.removeAll()
-        for waiter in waiters {
-            waiter.resume()
+        var remaining: [QuiescenceWaiter] = []
+        for waiter in quiescenceWaiters {
+            let satisfied = waiter.includesOpens
+                ? activeOperationCount == 0
+                : activeOperationCount - activeOpenCount == 0
+            if satisfied {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        quiescenceWaiters = remaining
+    }
+
+    private func awaitQuiescence(includingOpens: Bool) async {
+        let pending = includingOpens
+            ? activeOperationCount
+            : activeOperationCount - activeOpenCount
+        guard pending > 0 else { return }
+        await withCheckedContinuation { continuation in
+            quiescenceWaiters.append(
+                QuiescenceWaiter(includesOpens: includingOpens, continuation: continuation)
+            )
         }
     }
 

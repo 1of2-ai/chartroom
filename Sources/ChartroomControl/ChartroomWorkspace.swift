@@ -280,18 +280,40 @@ public actor ChartroomWorkspace {
             } catch {
                 failures.append("\(directoryName): \(error)")
             }
-        case let .adopted(parent, storeName, storeIdentity):
+        case let .adopted(
+            parent,
+            storeName,
+            storeIdentity,
+            walIdentity,
+            sharedMemoryIdentity
+        ):
             do {
                 guard let storeIdentity else {
                     try parent.verifyEntryAbsent(named: storeName)
                     break
                 }
+                let sidecars = [
+                    (name: storeName + "-wal", identity: walIdentity),
+                    (name: storeName + "-shm", identity: sharedMemoryIdentity),
+                ]
+                for sidecar in sidecars {
+                    try parent.verifyFileRemovalTarget(
+                        named: sidecar.name,
+                        expectedIdentity: sidecar.identity
+                    )
+                }
                 try parent.removeFileIfPresent(
                     named: storeName,
                     expectedIdentity: storeIdentity
                 )
-                for suffix in ["-wal", "-shm"] {
-                    try parent.removeFileIfPresent(named: storeName + suffix)
+                for sidecar in sidecars {
+                    guard let expectedIdentity = sidecar.identity else {
+                        continue
+                    }
+                    try parent.removeFileIfPresent(
+                        named: sidecar.name,
+                        expectedIdentity: expectedIdentity
+                    )
                 }
             } catch {
                 failures.append("\(storeName): \(error)")
@@ -348,10 +370,13 @@ public actor ChartroomWorkspace {
                 return .unavailable("The adopted store filename is invalid.")
             }
             let parent = try storeDirectoryAnchor(for: directory)
+            let storeName = store.lastPathComponent
             return .adopted(
                 parent: parent,
-                storeName: store.lastPathComponent,
-                storeIdentity: try parent.entryIdentity(named: store.lastPathComponent)
+                storeName: storeName,
+                storeIdentity: try parent.entryIdentity(named: storeName),
+                walIdentity: try parent.entryIdentity(named: storeName + "-wal"),
+                sharedMemoryIdentity: try parent.entryIdentity(named: storeName + "-shm")
             )
         } catch {
             return .unavailable("Could not bind the store cleanup location: \(error)")
@@ -753,7 +778,9 @@ private enum StoreDeletionBinding {
     case adopted(
         parent: StoreDirectoryAnchor,
         storeName: String,
-        storeIdentity: StoreEntryIdentity?
+        storeIdentity: StoreEntryIdentity?,
+        walIdentity: StoreEntryIdentity?,
+        sharedMemoryIdentity: StoreEntryIdentity?
     )
     case managedLeafAbsent(
         parent: StoreDirectoryAnchor,
@@ -765,7 +792,7 @@ private enum StoreDeletionBinding {
         switch self {
         case let .managed(_, _, identity):
             return identity.fileType == S_IFDIR
-        case let .adopted(_, _, identity):
+        case let .adopted(_, _, identity, _, _):
             return identity == nil || identity?.fileType == S_IFREG
         case .managedLeafAbsent, .unavailable:
             return true
@@ -782,8 +809,8 @@ private enum StoreDeletionBinding {
                 && lhsName == rhsName
                 && lhsIdentity == rhsIdentity
         case let (
-            .adopted(lhsParent, lhsName, lhsIdentity),
-            .adopted(rhsParent, rhsName, rhsIdentity)
+            .adopted(lhsParent, lhsName, lhsIdentity, _, _),
+            .adopted(rhsParent, rhsName, rhsIdentity, _, _)
         ):
             return lhsParent.identity == rhsParent.identity
                 && lhsName == rhsName
@@ -852,37 +879,25 @@ private final class StoreDirectoryAnchor {
 
     func removeFileIfPresent(
         named name: String,
-        expectedIdentity: StoreEntryIdentity? = nil
+        expectedIdentity: StoreEntryIdentity
     ) throws {
         guard Self.isSafeLeafName(name) else {
             throw Error(operation: "unlink", item: name, code: EINVAL)
         }
-
-        if let expectedIdentity {
-            guard let tombstone = try detachVerifiedEntry(
-                named: name,
-                expectedIdentity: expectedIdentity
-            ) else {
-                return
-            }
-            let result = tombstone.withCString {
-                Darwin.unlinkat(descriptor, $0, 0)
-            }
-            guard result == 0 else {
-                throw Error(operation: "unlink", item: name, code: Darwin.errno)
-            }
+        guard expectedIdentity.fileType != S_IFDIR else {
+            throw Error(operation: "unlink", item: name, code: EISDIR)
+        }
+        guard let tombstone = try detachVerifiedEntry(
+            named: name,
+            expectedIdentity: expectedIdentity
+        ) else {
             return
         }
-
-        let result = name.withCString {
+        let result = tombstone.withCString {
             Darwin.unlinkat(descriptor, $0, 0)
         }
         guard result == 0 else {
-            let code = Darwin.errno
-            if code == ENOENT {
-                return
-            }
-            throw Error(operation: "unlink", item: name, code: code)
+            throw Error(operation: "unlink", item: name, code: Darwin.errno)
         }
     }
 
@@ -907,6 +922,21 @@ private final class StoreDirectoryAnchor {
 
     func verifyEntryAbsent(named name: String) throws {
         guard try entryIdentity(named: name) == nil else {
+            throw Error(operation: "verify", item: name, code: EBUSY)
+        }
+    }
+
+    func verifyFileRemovalTarget(
+        named name: String,
+        expectedIdentity: StoreEntryIdentity?
+    ) throws {
+        if expectedIdentity?.fileType == S_IFDIR {
+            throw Error(operation: "verify", item: name, code: EISDIR)
+        }
+        guard let currentIdentity = try entryIdentity(named: name) else {
+            return
+        }
+        guard currentIdentity == expectedIdentity else {
             throw Error(operation: "verify", item: name, code: EBUSY)
         }
     }

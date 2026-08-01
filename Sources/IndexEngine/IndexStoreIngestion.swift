@@ -59,23 +59,34 @@ extension IndexStore {
     /// Idempotent: chunks that already have a vector in the active space are skipped, so an
     /// interrupted rebuild resumes rather than restarting.
     public func rebuildActiveEmbeddingSpace(batchSize: Int = 32) async throws -> EmbeddingRebuildSummary {
-        let pending = try chunksMissingActiveEmbedding()
-        guard !pending.isEmpty else { return EmbeddingRebuildSummary() }
+        let pageSize = max(1, batchSize)
+        var cursor: RebuildCursor?
+        var summary = EmbeddingRebuildSummary()
 
-        var summary = EmbeddingRebuildSummary(
-            skippedNonTextChunkCount: pending.count { !$0.isTextModality }
-        )
-        let rebuildable = pending.filter(\.isTextModality)
+        while true {
+            let page = try chunksMissingActiveEmbedding(after: cursor, limit: pageSize)
+            guard let last = page.last else {
+                // A concurrent write in another store can introduce a missing chunk before this
+                // pass's cursor. Restart only when text work remains; non-text chunks are expected
+                // to stay missing until their source is ingested again.
+                let remaining = try missingEmbeddingWorkCounts()
+                if remaining.text > 0 {
+                    cursor = nil
+                    continue
+                }
+                summary.skippedNonTextChunkCount = remaining.nonText
+                return summary
+            }
+            cursor = last.cursor
+            let batch = page.filter(\.isTextModality)
+            guard !batch.isEmpty else { continue }
 
-        for batch in stride(from: 0, to: rebuildable.count, by: max(1, batchSize)).map({
-            Array(rebuildable[$0..<min($0 + max(1, batchSize), rebuildable.count)])
-        }) {
             let vectors = try await embedder.embed(batch.map(\.text), kind: .document)
+            try validateEmbeddingBatch(vectors, expectedCount: batch.count, kind: .document)
             var prepared: [PreparedEmbedding] = []
             prepared.reserveCapacity(batch.count)
             for (index, chunk) in batch.enumerated() {
                 let vector = vectors[index]
-                try validateEmbedding(vector, kind: .document)
                 prepared.append(
                     PreparedEmbedding(
                         id: "\(chunk.id):embedding:\(embeddingSpaceID)",
@@ -93,52 +104,154 @@ extension IndexStore {
             // One transaction per batch: a rebuild can span a large corpus, and a failure part way
             // through should leave the batches already written intact for the resume to skip.
             let now = Date.now.timeIntervalSince1970
+            var persistedCount = 0
             try db.transaction {
-                try self.persistEmbeddings(prepared, activeEmbeddingSpaceID: self.embeddingSpaceID, now: now)
+                // Embedding awaited above, so another actor/store may have replaced this page.
+                // Revalidate under the write transaction and persist only chunks that are still
+                // active, text-derived, and missing this space.
+                let currentIDs = try self.currentRebuildableChunkIDs(
+                    among: Set(prepared.map(\.chunkID))
+                )
+                let current = prepared.filter { currentIDs.contains($0.chunkID) }
+                try self.persistEmbeddings(
+                    current,
+                    activeEmbeddingSpaceID: self.embeddingSpaceID,
+                    now: now
+                )
+                persistedCount = current.count
             }
-            summary.rebuiltChunkCount += prepared.count
+            summary.rebuiltChunkCount += persistedCount
         }
-
-        return summary
     }
 
-    private struct RebuildableChunk {
+    struct RebuildCursor: Sendable, Equatable {
+        var documentID: String
+        var ordinal: Int
+        var chunkID: String
+    }
+
+    struct RebuildableChunk: Sendable, Equatable {
         var id: String
+        var documentID: String
+        var ordinal: Int
         var text: String
         var isTextModality: Bool
+
+        var cursor: RebuildCursor {
+            RebuildCursor(documentID: documentID, ordinal: ordinal, chunkID: id)
+        }
     }
 
-    /// Active chunks with no vector in the current space, tagged with the modality any *other*
-    /// space recorded for them — that is how an image-derived chunk is recognised without its file.
-    private func chunksMissingActiveEmbedding() throws -> [RebuildableChunk] {
+    /// Active chunks with no vector in the current space. Modality belongs to the current chunk
+    /// projection, not to an arbitrary historical embedding space.
+    ///
+    /// Keyset pagination is required here. Each persisted page removes rows from the pending set,
+    /// so OFFSET pagination would skip work; a cursor over immutable identity/order columns remains
+    /// stable while the result set shrinks.
+    func chunksMissingActiveEmbedding(
+        after cursor: RebuildCursor?,
+        limit: Int
+    ) throws -> [RebuildableChunk] {
+        guard limit > 0 else { return [] }
+        let cursorPredicate: String
+        let limitParameter: Int32
+        if cursor == nil {
+            cursorPredicate = ""
+            limitParameter = 2
+        } else {
+            cursorPredicate = """
+             AND (
+               chunks.document_id > ?2
+               OR (chunks.document_id = ?2 AND chunks.ordinal > ?3)
+               OR (chunks.document_id = ?2 AND chunks.ordinal = ?3 AND chunks.id > ?4)
+             )
+            """
+            limitParameter = 5
+        }
         let statement = try db.prepare("""
-        SELECT chunks.id, chunks.text, (
-          SELECT modality FROM embeddings WHERE embeddings.chunk_id = chunks.id LIMIT 1
-        ) FROM chunks
+        SELECT chunks.id, chunks.document_id, chunks.ordinal, chunks.text,
+               chunks.embedding_modality
+        FROM chunks
         WHERE chunks.active = 1 AND NOT EXISTS (
           SELECT 1 FROM embeddings
           WHERE embeddings.chunk_id = chunks.id AND embeddings.embedding_space_id = ?1
         )
-        ORDER BY chunks.document_id ASC, chunks.ordinal ASC
+        \(cursorPredicate)
+        ORDER BY chunks.document_id ASC, chunks.ordinal ASC, chunks.id ASC
+        LIMIT ?\(limitParameter)
         """)
         statement.bind(1, embeddingSpaceID)
+        if let cursor {
+            statement.bind(2, cursor.documentID)
+            statement.bind(3, cursor.ordinal)
+            statement.bind(4, cursor.chunkID)
+        }
+        statement.bind(limitParameter, limit)
 
         var chunks: [RebuildableChunk] = []
         while try statement.step() {
             guard let id = statement.text(0) else { continue }
-            let recordedModality = statement.text(2)
+            let recordedModality = statement.text(4)
             chunks.append(
                 RebuildableChunk(
                     id: id,
-                    text: statement.text(1) ?? "",
-                    // No recorded modality means nothing was ever embedded for this chunk, which
-                    // only happens for text: image documents write their vector at ingest.
-                    isTextModality: recordedModality == nil
-                        || recordedModality == EmbeddingModality.text.rawValue
+                    documentID: statement.text(1) ?? "",
+                    ordinal: statement.int(2),
+                    text: statement.text(3) ?? "",
+                    isTextModality: recordedModality == EmbeddingModality.text.rawValue
                 )
             )
         }
         return chunks
+    }
+
+    private func missingEmbeddingWorkCounts() throws -> (text: Int, nonText: Int) {
+        let statement = try db.prepare("""
+        SELECT
+          COUNT(CASE WHEN chunks.embedding_modality = ?2 THEN 1 END),
+          COUNT(CASE WHEN chunks.embedding_modality != ?2 THEN 1 END)
+        FROM chunks
+        WHERE chunks.active = 1
+          AND NOT EXISTS (
+            SELECT 1 FROM embeddings
+            WHERE embeddings.chunk_id = chunks.id AND embeddings.embedding_space_id = ?1
+          )
+        """)
+        statement.bind(1, embeddingSpaceID)
+        statement.bind(2, EmbeddingModality.text.rawValue)
+        guard try statement.step() else { return (0, 0) }
+        return (text: statement.int(0), nonText: statement.int(1))
+    }
+
+    private func currentRebuildableChunkIDs(among chunkIDs: Set<String>) throws -> Set<String> {
+        guard !chunkIDs.isEmpty else { return [] }
+        let sortedIDs = chunkIDs.sorted()
+        let maximumBatchSize = 400
+        var current = Set<String>()
+        for start in stride(from: 0, to: sortedIDs.count, by: maximumBatchSize) {
+            let batch = Array(sortedIDs[start..<min(start + maximumBatchSize, sortedIDs.count)])
+            let statement = try db.prepare("""
+            SELECT chunks.id FROM chunks
+            WHERE chunks.active = 1
+              AND chunks.embedding_modality = ?2
+              AND NOT EXISTS (
+                SELECT 1 FROM embeddings
+                WHERE embeddings.chunk_id = chunks.id AND embeddings.embedding_space_id = ?1
+              )
+              AND chunks.id IN (\(Self.placeholders(count: batch.count, startingAt: 3)))
+            """)
+            statement.bind(1, embeddingSpaceID)
+            statement.bind(2, EmbeddingModality.text.rawValue)
+            for (offset, chunkID) in batch.enumerated() {
+                statement.bind(Int32(offset + 3), chunkID)
+            }
+            while try statement.step() {
+                if let chunkID = statement.text(0) {
+                    current.insert(chunkID)
+                }
+            }
+        }
+        return current
     }
 
     public func upsert(_ obj: IndexedObject) async throws {
@@ -174,25 +287,35 @@ extension IndexStore {
         let mutationToken = try beginDocumentMutation(for: obj.id)
         defer { try? clearDocumentMutation(mutationToken, for: obj.id) }
 
-        // Compute one vector per chunk. Text documents embed all chunks in a single batch so the
-        // embedder can group them by bucket and run them together; image documents embed the file
-        // once and attach that vector to the (single) chunk.
+        // Compute one vector per cache miss. Chunk IDs include content, lineage, policy, and
+        // chunker identity, so an existing structurally valid vector in this embedding space is
+        // proof that the same chunk has already been embedded. Image inputs are always re-read:
+        // their source bytes are not represented by the stored chunk text.
+        let chunksToEmbed: [PreparedChunk]
         let vectors: [[Float]]
         let modality: EmbeddingModality
         if let imageURL {
             let vector = try await embedder.embedImage(at: imageURL)
+            chunksToEmbed = chunks
             vectors = Array(repeating: vector, count: chunks.count)
             modality = .image
         } else {
-            vectors = try await embedder.embed(chunks.map(\.text), kind: .document)
+            let cachedChunkIDs = try cachedEmbeddingChunkIDs(
+                among: Set(chunks.map(\.id)),
+                embeddingSpaceID: activeEmbeddingSpaceID
+            )
+            chunksToEmbed = chunks.filter { !cachedChunkIDs.contains($0.id) }
+            vectors = chunksToEmbed.isEmpty
+                ? []
+                : try await embedder.embed(chunksToEmbed.map(\.text), kind: .document)
             modality = .text
         }
+        try validateEmbeddingBatch(vectors, expectedCount: chunksToEmbed.count, kind: .document)
 
         var embeddings: [PreparedEmbedding] = []
-        embeddings.reserveCapacity(chunks.count)
-        for (index, chunk) in chunks.enumerated() {
+        embeddings.reserveCapacity(chunksToEmbed.count)
+        for (index, chunk) in chunksToEmbed.enumerated() {
             let vector = vectors[index]
-            try validateEmbedding(vector, kind: .document)
             embeddings.append(
                 PreparedEmbedding(
                     id: "\(chunk.id):embedding:\(activeEmbeddingSpaceID)",
@@ -240,8 +363,7 @@ extension IndexStore {
             )
             try self.removeChunkRecords(
                 documentID: obj.id,
-                retaining: Set(chunks.map(\.id)),
-                activeEmbeddingSpaceID: activeEmbeddingSpaceID
+                retaining: Set(chunks.map(\.id))
             )
             try self.persistChunks(
                 chunks,
@@ -253,6 +375,7 @@ extension IndexStore {
                 policyVersion: policyVersion,
                 title: obj.title,
                 sourceURI: sourceURI,
+                modality: modality,
                 now: now
             )
             try self.persistEmbeddings(
@@ -530,32 +653,25 @@ extension IndexStore {
     /// transaction, so search never observes the document without its replacement chunks.
     ///
     /// Chunk IDs hash their occurrence and content, so an ID that appears in both the old and
-    /// new chunk sets denotes the same text at the same position. Those rows are left in place
-    /// for `persistChunks` to update, and only the *active* embedding space is cleared for them —
-    /// another model's vectors for that chunk are still valid and must survive. Chunks that are
-    /// not retained can never be referenced again, so they take every space's embeddings with them.
+    /// new chunk sets denotes the same text under the same lineage, policy, and chunker. Those rows
+    /// and every embedding space attached to them remain valid while `persistChunks` refreshes
+    /// positional and display metadata. Chunks that are not retained can never be referenced again,
+    /// so they take every space's embeddings with them.
     ///
     /// - Parameters:
     ///   - retaining: Chunk IDs the caller is about to re-persist. Empty means the document is
     ///     going away entirely, which clears every chunk in every space.
-    ///   - activeEmbeddingSpaceID: The space being rebuilt. `nil` clears all spaces.
     private func removeChunkRecords(
         documentID: String,
-        retaining retainedChunkIDs: Set<String> = [],
-        activeEmbeddingSpaceID: String? = nil
+        retaining retainedChunkIDs: Set<String> = []
     ) throws {
         let existing = try allChunkIDs(documentID: documentID)
         let obsolete = existing.filter { !retainedChunkIDs.contains($0) }
-        let retained = existing.filter { retainedChunkIDs.contains($0) }
 
         for chunkID in obsolete {
             try deleteFTSChunk(chunkID: chunkID)
         }
         try deleteEmbeddingsAndVectors(chunkIDs: obsolete, embeddingSpaceID: nil)
-
-        if let activeEmbeddingSpaceID, !retained.isEmpty {
-            try deleteEmbeddingsAndVectors(chunkIDs: retained, embeddingSpaceID: activeEmbeddingSpaceID)
-        }
 
         guard !obsolete.isEmpty else { return }
         let chunks = try db.prepare("""
@@ -579,6 +695,7 @@ extension IndexStore {
         policyVersion: Int,
         title: String,
         sourceURI: String,
+        modality: EmbeddingModality,
         now: TimeInterval
     ) throws {
         // One prepare per statement, reset per chunk — preparing inside the loop
@@ -589,16 +706,36 @@ extension IndexStore {
           chunker_id,chunker_version,policy_id,policy_version,text,context_prefix,context_suffix,
           heading_path,byte_start,byte_end,character_start,character_end,token_start,token_end,
           page_start,page_end,section_label,content_hash,active,availability_state,created_at,
-          line_start,line_end
-        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,1,?25,?26,?27,?28)
-        ON CONFLICT(id) DO UPDATE SET text=excluded.text,
+          line_start,line_end,embedding_modality
+        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,1,?25,?26,?27,?28,?29)
+        ON CONFLICT(id) DO UPDATE SET document_version_id=excluded.document_version_id,
+          representation_id=excluded.representation_id,
+          representation_lineage_id=excluded.representation_lineage_id,
+          ordinal=excluded.ordinal,
+          chunker_id=excluded.chunker_id,
+          chunker_version=excluded.chunker_version,
+          policy_id=excluded.policy_id,
+          policy_version=excluded.policy_version,
+          text=excluded.text,
           active=1,
           availability_state=excluded.availability_state,
           created_at=excluded.created_at,
           context_prefix=excluded.context_prefix,
           context_suffix=excluded.context_suffix,
+          heading_path=excluded.heading_path,
+          byte_start=excluded.byte_start,
+          byte_end=excluded.byte_end,
+          character_start=excluded.character_start,
+          character_end=excluded.character_end,
+          token_start=excluded.token_start,
+          token_end=excluded.token_end,
+          page_start=excluded.page_start,
+          page_end=excluded.page_end,
+          section_label=excluded.section_label,
+          content_hash=excluded.content_hash,
           line_start=excluded.line_start,
-          line_end=excluded.line_end
+          line_end=excluded.line_end,
+          embedding_modality=excluded.embedding_modality
         """)
         let ftsDelete = try db.prepare("DELETE FROM chunks_fts WHERE chunk_id = ?1")
         let fts = try db.prepare("""
@@ -637,6 +774,7 @@ extension IndexStore {
             statement.bind(26, now)
             statement.bind(27, chunk.lineStart)
             statement.bind(28, chunk.lineEnd)
+            statement.bind(29, modality.rawValue)
             try statement.step()
 
             ftsDelete.reset()
@@ -666,7 +804,16 @@ extension IndexStore {
           id,chunk_id,embedding_space_id,model_id,model_version,dimension,modality,prompt_kind,
           vector_backend_id,vector_backend_version,vector_hash,created_at
         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-        ON CONFLICT(id) DO UPDATE SET vector_hash=excluded.vector_hash,
+        ON CONFLICT(id) DO UPDATE SET chunk_id=excluded.chunk_id,
+          embedding_space_id=excluded.embedding_space_id,
+          model_id=excluded.model_id,
+          model_version=excluded.model_version,
+          dimension=excluded.dimension,
+          modality=excluded.modality,
+          prompt_kind=excluded.prompt_kind,
+          vector_backend_id=excluded.vector_backend_id,
+          vector_backend_version=excluded.vector_backend_version,
+          vector_hash=excluded.vector_hash,
           created_at=excluded.created_at
         """)
         let vector = try db.prepare("""
@@ -696,6 +843,55 @@ extension IndexStore {
             vector.bindBlob(3, Vector.toBytes(embedding.vector))
             try vector.step()
         }
+    }
+
+    /// Chunk IDs with complete vector records reusable by this exact embedding space. The query
+    /// joins the vector table and validates both declared and physical dimensions so a half-written
+    /// or malformed cache entry becomes a miss instead of being trusted.
+    private func cachedEmbeddingChunkIDs(
+        among chunkIDs: Set<String>,
+        embeddingSpaceID: String
+    ) throws -> Set<String> {
+        guard !chunkIDs.isEmpty else { return [] }
+        let sortedIDs = chunkIDs.sorted()
+        let maximumBatchSize = 400
+        var cached = Set<String>()
+
+        for start in stride(from: 0, to: sortedIDs.count, by: maximumBatchSize) {
+            let batch = Array(sortedIDs[start..<min(start + maximumBatchSize, sortedIDs.count)])
+            let statement = try db.prepare("""
+            SELECT embeddings.chunk_id
+            FROM embeddings
+            JOIN vectors ON vectors.id = embeddings.id
+            WHERE embeddings.embedding_space_id = ?1
+              AND embeddings.dimension = ?2
+              AND vectors.dim = ?2
+              AND length(vectors.vec) = ?3
+              AND embeddings.modality = ?4
+              AND embeddings.prompt_kind = ?5
+              AND embeddings.model_id = ?6
+              AND embeddings.vector_backend_id = ?7
+              AND embeddings.vector_backend_version = ?8
+              AND embeddings.chunk_id IN (\(Self.placeholders(count: batch.count, startingAt: 9)))
+            """)
+            statement.bind(1, embeddingSpaceID)
+            statement.bind(2, dimension)
+            statement.bind(3, dimension * MemoryLayout<Float>.size)
+            statement.bind(4, EmbeddingModality.text.rawValue)
+            statement.bind(5, EmbedKind.document.rawValue)
+            statement.bind(6, modelID)
+            statement.bind(7, vectorBackendID)
+            statement.bind(8, vectorBackendVersion)
+            for (offset, chunkID) in batch.enumerated() {
+                statement.bind(Int32(offset + 9), chunkID)
+            }
+            while try statement.step() {
+                if let chunkID = statement.text(0) {
+                    cached.insert(chunkID)
+                }
+            }
+        }
+        return cached
     }
 
     private func activeChunkIDs(documentID: String) throws -> [String] {

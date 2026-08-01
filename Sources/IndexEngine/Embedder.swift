@@ -13,6 +13,9 @@ public enum EmbedKind: String, Codable, Hashable, Sendable {
 /// drop in behind this; `modelID` tags every stored vector so two models' spaces
 /// are never silently mixed in one search.
 public protocol Embedder: Sendable {
+    /// Stable identity for one semantic vector contract. Change this value, or override
+    /// `embeddingSpaceID`, whenever model weights, prompting, preprocessing, or output semantics
+    /// change; equal space IDs authorize reuse of persisted vectors.
     var modelID: String { get }
     var dimension: Int { get }
     var embeddingSpaceID: String { get }

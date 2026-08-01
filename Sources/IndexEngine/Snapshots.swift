@@ -414,6 +414,19 @@ public struct EmbeddingSpaceCoverage: Codable, Hashable, Sendable {
     }
 }
 
+/// Result of inspecting whether stored vectors belong to the active embedder's space.
+///
+/// `SearchDiagnostics.embeddingSpaceCoverageState == nil` means the read was not needed. An
+/// unavailable read is distinct from a healthy store: retrieval may still return lexical results,
+/// but it cannot claim whether the vector space is complete.
+public enum EmbeddingSpaceCoverageState: String, Codable, Hashable, Sendable {
+    /// The coverage read succeeded and the active space is not wholly absent. Other historical
+    /// spaces may still be present, so this is deliberately narrower than "healthy."
+    case notOrphaned
+    case orphaned
+    case unavailable
+}
+
 public struct SearchDiagnostics: Codable, Hashable, Sendable {
     public var degraded: Bool
     public var missingChannels: [RetrievalChannel]
@@ -421,6 +434,7 @@ public struct SearchDiagnostics: Codable, Hashable, Sendable {
     /// nothing and no error was raised — without this flag the result is indistinguishable from
     /// an honestly empty index.
     public var embeddingSpaceMismatch: Bool
+    public var embeddingSpaceCoverageState: EmbeddingSpaceCoverageState?
     public var sqlFilterLatency: TimeInterval?
     public var ftsLatency: TimeInterval?
     public var vectorLatency: TimeInterval?
@@ -442,6 +456,31 @@ public struct SearchDiagnostics: Codable, Hashable, Sendable {
         self.degraded = degraded
         self.missingChannels = missingChannels
         self.embeddingSpaceMismatch = embeddingSpaceMismatch
+        self.embeddingSpaceCoverageState = nil
+        self.sqlFilterLatency = sqlFilterLatency
+        self.ftsLatency = ftsLatency
+        self.vectorLatency = vectorLatency
+        self.fusionLatency = fusionLatency
+        self.snippetLatency = snippetLatency
+        self.totalLatency = totalLatency
+    }
+
+    public init(
+        degraded: Bool = false,
+        missingChannels: [RetrievalChannel] = [],
+        embeddingSpaceMismatch: Bool = false,
+        embeddingSpaceCoverageState: EmbeddingSpaceCoverageState?,
+        sqlFilterLatency: TimeInterval? = nil,
+        ftsLatency: TimeInterval? = nil,
+        vectorLatency: TimeInterval? = nil,
+        fusionLatency: TimeInterval? = nil,
+        snippetLatency: TimeInterval? = nil,
+        totalLatency: TimeInterval? = nil
+    ) {
+        self.degraded = degraded
+        self.missingChannels = missingChannels
+        self.embeddingSpaceMismatch = embeddingSpaceMismatch
+        self.embeddingSpaceCoverageState = embeddingSpaceCoverageState
         self.sqlFilterLatency = sqlFilterLatency
         self.ftsLatency = ftsLatency
         self.vectorLatency = vectorLatency

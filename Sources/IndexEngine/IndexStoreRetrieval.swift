@@ -196,9 +196,19 @@ extension IndexStore {
         let fusionLatency = Date.now.timeIntervalSince(fusionStart)
         // Only worth a query when the vector channel was asked for and came back empty: that is
         // the one outcome an embedding-space mismatch is indistinguishable from.
-        let coverage = vectorLimit > 0 && vector.isEmpty
-            ? try? embeddingSpaceCoverage()
-            : nil
+        let coverageAssessment = try Self.assessEmbeddingSpaceCoverage(
+            shouldEvaluate: vectorLimit > 0
+                && vector.isEmpty
+                && !missingChannels.contains(.vector),
+            allowDegradedResults: allowDegradedResults,
+            read: {
+                if let reader = self.embeddingSpaceCoverageReader {
+                    return try reader()
+                }
+                return try self.embeddingSpaceCoverage()
+            }
+        )
+        let coverage = coverageAssessment.coverage
         let embeddingSpaceMismatch = vectorLimit > 0 && vector.isEmpty
             && (coverage?.isOrphaned ?? false)
         if embeddingSpaceMismatch, !allowDegradedResults {
@@ -212,9 +222,12 @@ extension IndexStore {
         return (
             hits,
             SearchDiagnostics(
-                degraded: !missingChannels.isEmpty || embeddingSpaceMismatch,
+                degraded: !missingChannels.isEmpty
+                    || embeddingSpaceMismatch
+                    || coverageAssessment.state == .unavailable,
                 missingChannels: missingChannels,
                 embeddingSpaceMismatch: embeddingSpaceMismatch,
+                embeddingSpaceCoverageState: coverageAssessment.state,
                 sqlFilterLatency: sqlLatency,
                 ftsLatency: ftsLatency,
                 vectorLatency: vectorLatency,
@@ -223,6 +236,33 @@ extension IndexStore {
                 totalLatency: Date.now.timeIntervalSince(started)
             )
         )
+    }
+
+    struct EmbeddingSpaceCoverageAssessment {
+        var coverage: EmbeddingSpaceCoverage?
+        var state: EmbeddingSpaceCoverageState?
+    }
+
+    /// Separates the read from its retrieval policy so an unavailable coverage query cannot be
+    /// collapsed into the same value as a successful healthy read.
+    static func assessEmbeddingSpaceCoverage(
+        shouldEvaluate: Bool,
+        allowDegradedResults: Bool,
+        read: () throws -> EmbeddingSpaceCoverage
+    ) throws -> EmbeddingSpaceCoverageAssessment {
+        guard shouldEvaluate else {
+            return EmbeddingSpaceCoverageAssessment(coverage: nil, state: nil)
+        }
+        do {
+            let coverage = try read()
+            return EmbeddingSpaceCoverageAssessment(
+                coverage: coverage,
+                state: coverage.isOrphaned ? .orphaned : .notOrphaned
+            )
+        } catch {
+            guard allowDegradedResults else { throw error }
+            return EmbeddingSpaceCoverageAssessment(coverage: nil, state: .unavailable)
+        }
     }
 
     private func exactIDs(
@@ -401,17 +441,32 @@ extension IndexStore {
         return CandidateFilter(whereSQL: clauses.joined(separator: " AND "), bindings: bindings)
     }
 
-    private func clusterMap(_ ids: Set<String>) throws -> [String: String] {
+    /// Loads candidate cluster membership in bounded groups. A soft-scoped search can fuse
+    /// thousands of candidates, so one query per ID is an N+1 and one unbounded `IN` risks
+    /// exceeding SQLite's parameter limit.
+    func clusterMap(_ ids: Set<String>, batchSize: Int = 500) throws -> [String: String] {
+        guard !ids.isEmpty else { return [:] }
+        let sortedIDs = ids.sorted()
+        let effectiveBatchSize = min(max(1, batchSize), 500)
         var map: [String: String] = [:]
-        let statement = try db.prepare("""
-        SELECT documents.cluster_id FROM chunks
-        JOIN documents ON documents.id = chunks.document_id
-        WHERE chunks.id = ?1
-        """)
-        for id in ids {
-            statement.reset()
-            statement.bind(1, id)
-            if try statement.step(), let clusterID = statement.text(0), !clusterID.isEmpty {
+        map.reserveCapacity(ids.count)
+        for start in stride(from: 0, to: sortedIDs.count, by: effectiveBatchSize) {
+            let batch = Array(
+                sortedIDs[start..<min(start + effectiveBatchSize, sortedIDs.count)]
+            )
+            let statement = try db.prepare("""
+            SELECT chunks.id, documents.cluster_id FROM chunks
+            JOIN documents ON documents.id = chunks.document_id
+            WHERE chunks.id IN (\(Self.placeholders(count: batch.count)))
+            """)
+            for (offset, id) in batch.enumerated() {
+                statement.bind(Int32(offset + 1), id)
+            }
+            while try statement.step() {
+                guard let id = statement.text(0),
+                      let clusterID = statement.text(1),
+                      !clusterID.isEmpty
+                else { continue }
                 map[id] = clusterID
             }
         }

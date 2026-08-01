@@ -42,6 +42,38 @@ public extension EngineID {
     static let builtInSQLiteVectorBackend: EngineID = "indexengine.vector.sqlite-exact"
 }
 
+/// Whether one diagnostic-history channel was read from durable storage.
+public enum DiagnosticHistoryAvailability: String, Codable, Hashable, Sendable {
+    /// The durable query completed, including when it returned no rows.
+    case available
+    /// The client supports durable history, but its read failed.
+    case unavailable
+    /// The client does not expose a durable-history completeness signal.
+    case notSupported
+}
+
+/// Diagnostic entries together with a completeness signal for each durable table.
+///
+/// Jobs and failures remain separate because one table can be readable while the other is not.
+public struct DiagnosticHistory: Codable, Hashable, Sendable {
+    public var jobs: [JobSnapshot]
+    public var failures: [FailureSnapshot]
+    public var jobsAvailability: DiagnosticHistoryAvailability
+    public var failuresAvailability: DiagnosticHistoryAvailability
+
+    public init(
+        jobs: [JobSnapshot] = [],
+        failures: [FailureSnapshot] = [],
+        jobsAvailability: DiagnosticHistoryAvailability,
+        failuresAvailability: DiagnosticHistoryAvailability
+    ) {
+        self.jobs = jobs
+        self.failures = failures
+        self.jobsAvailability = jobsAvailability
+        self.failuresAvailability = failuresAvailability
+    }
+}
+
 /// Public facade used by apps, GUI view models, and test harnesses.
 public protocol IndexEngineClient: Sendable {
     func ingest(_ request: IngestRequest) async throws -> IngestionSummary
@@ -52,6 +84,7 @@ public protocol IndexEngineClient: Sendable {
     func health() async -> IndexHealthSnapshot
     func failures(limit: Int) async -> [FailureSnapshot]
     func jobs(limit: Int) async -> [JobSnapshot]
+    func diagnosticHistory(limit: Int) async -> DiagnosticHistory
     func modelStatus() async -> ModelStatusSnapshot
     func snapshot() async -> IndexEngineSnapshot
 
@@ -76,6 +109,17 @@ public extension IndexEngineClient {
     /// Lightweight clients (fixtures, mocks) hold no durable failures; the real engine
     /// overrides this to prune its store and in-memory diagnostics.
     func clearFailures(ids: Set<EngineID>?) async throws {}
+
+    /// Existing lightweight clients keep compiling and explicitly report that they cannot make a
+    /// durability claim. The concrete engine overrides this with independent store reads.
+    func diagnosticHistory(limit: Int) async -> DiagnosticHistory {
+        DiagnosticHistory(
+            jobs: await jobs(limit: limit),
+            failures: await failures(limit: limit),
+            jobsAvailability: .notSupported,
+            failuresAvailability: .notSupported
+        )
+    }
 
     /// Lightweight clients report the standard hybrid pipeline; the engine overrides this to
     /// fill in its live fusion parameter.

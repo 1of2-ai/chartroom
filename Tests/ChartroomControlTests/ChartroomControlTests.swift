@@ -1,9 +1,9 @@
 import ConnectorEngine
 import Foundation
-import IndexEngine
 import SyncEngine
 import Testing
 @testable import ChartroomControl
+@testable import IndexEngine
 
 @Suite("Chartroom session")
 struct ChartroomSessionTests {
@@ -20,6 +20,33 @@ struct ChartroomSessionTests {
         #expect(status.snapshot?.documentCount == 0)
         #expect(status.health?.documentCount == 0)
         #expect(status.modelStatus?.isAvailable == true)
+        #expect(status.diagnosticHistory?.jobsAvailability == .available)
+        #expect(status.diagnosticHistory?.failuresAvailability == .available)
+    }
+
+    @Test("status and session history propagate a durable channel failure")
+    func propagatesUnavailableDiagnosticHistory() async throws {
+        let storeURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("chartroom-history-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: storeURL) }
+        let engine = try await IndexEngine.open(
+            storeURL: storeURL,
+            configuration: .init(embedder: HashingEmbedder(dimension: 4))
+        )
+        let db = try SQLite(path: storeURL.path)
+        try db.exec("DROP TABLE failures")
+        let session = ChartroomSession(
+            engineFactory: { (engine, storeURL) },
+            cursorStore: InMemoryCursorStore()
+        )
+
+        let status = try await session.open()
+        #expect(status.diagnosticHistory?.failuresAvailability == .unavailable)
+        #expect(status.diagnosticHistory?.jobsAvailability == .available)
+
+        let history = try await session.diagnosticHistory(limit: 10)
+        #expect(history.failuresAvailability == .unavailable)
+        #expect(history.jobsAvailability == .available)
     }
 
     @Test("ingests a local source, searches it, browses it, inspects chunks, and deletes it")
@@ -58,6 +85,200 @@ struct ChartroomSessionTests {
 
         let empty = try await session.search(.init(query: "parity needle", mode: .diagnostic, limit: 5))
         #expect(empty.results.isEmpty)
+    }
+
+    @Test("syncs sharing a cursor key run serially and the follower reads the leader cursor")
+    func sameKeySyncsRunSerially() async throws {
+        let cursors = InMemoryCursorStore()
+        let session = ChartroomSession(
+            engineFactory: { (try await IndexEngine.openInMemory(), nil) },
+            cursorStore: cursors
+        )
+        _ = try await session.open()
+
+        let firstGate = ConnectorEntryGate()
+        let secondGate = ConnectorEntryGate(released: true)
+        let firstConnector = GatedCheckpointConnector(
+            id: "first",
+            checkpoint: "cursor-first",
+            gate: firstGate
+        )
+        let secondConnector = GatedCheckpointConnector(
+            id: "second",
+            checkpoint: "cursor-second",
+            gate: secondGate
+        )
+
+        let firstTask = Task {
+            try await session.sync(connector: firstConnector, cursorKey: "shared")
+        }
+        await firstGate.waitUntilEntered()
+
+        let secondTask = Task {
+            try await session.sync(connector: secondConnector, cursorKey: "shared")
+        }
+        let clock = ContinuousClock()
+        let overlapDeadline = clock.now.advanced(by: .milliseconds(100))
+        while !(await secondGate.hasEntered), clock.now < overlapDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let secondOverlappedFirst = await secondGate.hasEntered
+
+        await firstGate.release()
+        _ = try await firstTask.value
+        _ = try await secondTask.value
+
+        #expect(!secondOverlappedFirst)
+        #expect(firstConnector.receivedCursor == nil)
+        #expect(secondConnector.receivedCursor == "cursor-first")
+        #expect(cursors.cursor(forKey: "shared") == "cursor-second")
+    }
+
+    @Test("syncs with different cursor keys remain concurrent")
+    func differentKeySyncsRemainConcurrent() async throws {
+        let session = ChartroomSession(
+            engineFactory: { (try await IndexEngine.openInMemory(), nil) },
+            cursorStore: InMemoryCursorStore()
+        )
+        _ = try await session.open()
+
+        let firstGate = ConnectorEntryGate()
+        let secondGate = ConnectorEntryGate(released: true)
+        let firstConnector = GatedCheckpointConnector(
+            id: "first",
+            checkpoint: "cursor-first",
+            gate: firstGate
+        )
+        let secondConnector = GatedCheckpointConnector(
+            id: "second",
+            checkpoint: "cursor-second",
+            gate: secondGate
+        )
+
+        let firstTask = Task {
+            try await session.sync(connector: firstConnector, cursorKey: "first-key")
+        }
+        await firstGate.waitUntilEntered()
+
+        let secondTask = Task {
+            try await session.sync(connector: secondConnector, cursorKey: "second-key")
+        }
+        let clock = ContinuousClock()
+        let startDeadline = clock.now.advanced(by: .seconds(1))
+        while !(await secondGate.hasEntered), clock.now < startDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let secondStartedBeforeFirstFinished = await secondGate.hasEntered
+
+        await firstGate.release()
+        _ = try await firstTask.value
+        _ = try await secondTask.value
+
+        #expect(secondStartedBeforeFirstFinished)
+        #expect(secondConnector.receivedCursor == nil)
+    }
+
+    @Test("cancelling a queued same-key sync removes it without waiting for the leader")
+    func cancellingQueuedSameKeySyncRemovesIt() async throws {
+        let session = ChartroomSession(
+            engineFactory: { (try await IndexEngine.openInMemory(), nil) },
+            cursorStore: InMemoryCursorStore()
+        )
+        _ = try await session.open()
+
+        let firstGate = ConnectorEntryGate()
+        let secondGate = ConnectorEntryGate(released: true)
+        let firstTask = Task {
+            try await session.sync(
+                connector: GatedCheckpointConnector(
+                    id: "first",
+                    checkpoint: "cursor-first",
+                    gate: firstGate
+                ),
+                cursorKey: "shared"
+            )
+        }
+        await firstGate.waitUntilEntered()
+
+        let completion = SessionTaskCompletion()
+        let secondTask = Task {
+            do {
+                let outcome = try await session.sync(
+                    connector: GatedCheckpointConnector(
+                        id: "second",
+                        checkpoint: "cursor-second",
+                        gate: secondGate
+                    ),
+                    cursorKey: "shared"
+                )
+                await completion.markCompleted()
+                return outcome
+            } catch {
+                await completion.markCompleted()
+                throw error
+            }
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        secondTask.cancel()
+
+        let clock = ContinuousClock()
+        let cancellationDeadline = clock.now.advanced(by: .seconds(1))
+        while !(await completion.hasCompleted), clock.now < cancellationDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let completedBeforeLeader = await completion.hasCompleted
+        if !completedBeforeLeader {
+            await firstGate.release()
+        }
+        let secondOutcome = try await secondTask.value
+        let secondConnectorStarted = await secondGate.hasEntered
+
+        await firstGate.release()
+        _ = try await firstTask.value
+
+        #expect(completedBeforeLeader)
+        #expect(secondOutcome.stopped)
+        #expect(!secondConnectorStarted)
+    }
+
+    @Test("close() stops in-flight syncs and drains before returning")
+    func closeStopsInFlightSyncsAndDrains() async throws {
+        let session = ChartroomSession(
+            engineFactory: { (try await IndexEngine.openInMemory(), nil) },
+            cursorStore: InMemoryCursorStore()
+        )
+        _ = try await session.open()
+
+        // The gate is never released: only close() stopping the sync can finish it.
+        let gate = ConnectorEntryGate()
+        let completion = SessionTaskCompletion()
+        let syncTask = Task {
+            defer { Task { await completion.markCompleted() } }
+            return try await session.sync(
+                connector: GatedCheckpointConnector(id: "gated", checkpoint: "cursor", gate: gate),
+                cursorKey: "close-drain"
+            )
+        }
+        await gate.waitUntilEntered()
+
+        try await session.close()
+
+        // close() must not return while the sync is still running; the stop it issued
+        // lets the orchestrator finish without the gate ever being released.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while !(await completion.hasCompleted), clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await completion.hasCompleted, "close() returned while the sync was still in flight")
+
+        // Released only for cleanup; a drained sync has already finished without it.
+        await gate.release()
+        let outcome = try await syncTask.value
+        #expect(outcome.stopped)
+
+        let status = await session.status()
+        #expect(status.state == .unopened)
     }
 
     @Test("workspace persists index inclusion and keeps connector cursors separate per index")
@@ -180,5 +401,101 @@ private final class InMemoryCursorStore: CursorStore, @unchecked Sendable {
         lock.withLock {
             cursors[key] = cursor
         }
+    }
+}
+
+private actor ConnectorEntryGate {
+    private var entered = false
+    private var released: Bool
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(released: Bool = false) {
+        self.released = released
+    }
+
+    var hasEntered: Bool { entered }
+
+    func enterAndWait() async {
+        entered = true
+        let entryWaiters = self.entryWaiters
+        self.entryWaiters.removeAll()
+        for waiter in entryWaiters {
+            waiter.resume()
+        }
+
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let releaseWaiters = self.releaseWaiters
+        self.releaseWaiters.removeAll()
+        for waiter in releaseWaiters {
+            waiter.resume()
+        }
+    }
+}
+
+private actor SessionTaskCompletion {
+    private var completed = false
+
+    var hasCompleted: Bool { completed }
+
+    func markCompleted() {
+        completed = true
+    }
+}
+
+private final class GatedCheckpointConnector: SourceConnector, @unchecked Sendable {
+    let id: ConnectorID
+    let capabilities = ConnectorCapabilities(supportsIncrementalSync: true, supportsRuntimeTools: false)
+
+    private let checkpoint: SourceCursor
+    private let gate: ConnectorEntryGate
+    private let lock = NSLock()
+    private var _receivedCursor: SourceCursor?
+
+    init(id: ConnectorID, checkpoint: SourceCursor, gate: ConnectorEntryGate) {
+        self.id = id
+        self.checkpoint = checkpoint
+        self.gate = gate
+    }
+
+    var receivedCursor: SourceCursor? {
+        lock.withLock { _receivedCursor }
+    }
+
+    func validate() async throws {}
+
+    func changes(since cursor: SourceCursor?) async throws -> AsyncThrowingStream<SourceEvent, Error> {
+        lock.withLock {
+            _receivedCursor = cursor
+        }
+        await gate.enterAndWait()
+        return AsyncThrowingStream { continuation in
+            continuation.yield(.checkpoint(checkpoint))
+            continuation.finish()
+        }
+    }
+
+    func fetch(_ reference: SourceReference) async throws -> SourcePayload {
+        SourcePayload(
+            documentID: EngineID(rawValue: reference.externalID ?? reference.uri.lastPathComponent),
+            sourceID: id,
+            sourceURI: reference.uri,
+            displayName: reference.uri.lastPathComponent,
+            body: .binaryReference(reference.uri)
+        )
     }
 }

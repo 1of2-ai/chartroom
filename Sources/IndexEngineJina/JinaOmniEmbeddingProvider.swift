@@ -103,11 +103,13 @@ public final class JinaOmniEmbeddingProvider: Embedder, @unchecked Sendable {
         let omni = self.omni
         return try await withCheckedThrowingContinuation { continuation in
             queue.async {
-                do {
-                    continuation.resume(returning: try omni.embed(imageURL: url))
-                } catch {
-                    continuation.resume(throwing: error)
+                let result: Result<[Float], any Error> = autoreleasepool {
+                    Result { try omni.embed(imageURL: url) }
                 }
+                // Core ML can retain Objective-C temporaries until an autorelease pool drains.
+                // Finish that cleanup on the serial inference queue before waking the caller;
+                // otherwise the caller can race the image inference frame's teardown.
+                continuation.resume(with: result)
             }
         }
     }

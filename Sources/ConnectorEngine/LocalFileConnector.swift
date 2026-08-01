@@ -60,6 +60,11 @@ public struct LocalFileConnectorOptions: Codable, Hashable, Sendable {
 public struct LocalFileConnector: SourceConnector {
     fileprivate static let cursorPrefix = "local-file-v2:"
     fileprivate static let legacyCursorPrefix = "local-file-v1:"
+    private static let scanQueue = DispatchQueue(
+        label: "com.chartroom.local-file-scan",
+        qos: .utility,
+        attributes: .concurrent
+    )
 
     public let id: ConnectorID
     public let rootURL: URL
@@ -96,23 +101,31 @@ public struct LocalFileConnector: SourceConnector {
         let previousCursor = try decodedCursor(cursor)
 
         return AsyncThrowingStream { continuation in
-            let task = Task {
+            let cancellation = LocalFileScanCancellation()
+            Self.scanQueue.async {
                 do {
-                    try emitChanges(previousCursor: previousCursor, into: continuation)
+                    try emitChanges(
+                        previousCursor: previousCursor,
+                        checkCancellation: cancellation.check,
+                        into: continuation
+                    )
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { _ in cancellation.cancel() }
         }
     }
 
     private func emitChanges(
         previousCursor: LocalFileCursor?,
+        checkCancellation: () throws -> Void,
         into continuation: AsyncThrowingStream<SourceEvent, Error>.Continuation
     ) throws {
-        let scan = try scanPayloads()
+        try checkCancellation()
+        let scan = try scanPayloads(checkCancellation: checkCancellation)
+        try checkCancellation()
         let payloads = scan.payloads
 
         // Unreadable subtrees fail a FIRST sync loudly: nothing is at risk of deletion
@@ -129,15 +142,45 @@ public struct LocalFileConnector: SourceConnector {
             )
         }
 
-        let currentFingerprints = Dictionary(
-            uniqueKeysWithValues: payloads.map { ($0.documentID.rawValue, fileFingerprint(for: $0)) }
-        )
-        let currentDocumentIDs = Set(payloads.map(\.documentID.rawValue))
-        let missingDocumentIDs = previousCursor?.documentIDs.filter { !currentDocumentIDs.contains($0) } ?? []
-        let (shieldedDocumentIDs, deletedDocumentIDs) = partitionShielded(
-            missingDocumentIDs,
-            unreadablePrefixes: scan.unreadable.map { relativePath(for: $0.url) }
-        )
+        var currentFingerprints: [String: String] = [:]
+        var currentDocumentIDs: Set<String> = []
+        for payload in payloads {
+            try checkCancellation()
+            currentFingerprints[payload.documentID.rawValue] = fileFingerprint(for: payload)
+            currentDocumentIDs.insert(payload.documentID.rawValue)
+        }
+        var missingDocumentIDs: [String] = []
+        for documentID in previousCursor?.documentIDs ?? [] {
+            try checkCancellation()
+            if !currentDocumentIDs.contains(documentID) {
+                missingDocumentIDs.append(documentID)
+            }
+        }
+        // `relativePath(for:)` leaves a non-descendant path absolute, so the root
+        // itself — the enumerator's own failure URL when the walk cannot start —
+        // must not become a prefix: an absolute prefix matches no document-relative
+        // path and would reclassify every shielded document as deleted.
+        var unreadablePrefixes: [String] = []
+        var rootIsUnreadable = false
+        for failure in scan.unreadable {
+            try checkCancellation()
+            let failurePath = failure.url.standardizedFileURL.path
+            if failurePath == rootURL.path || !failurePath.hasPrefix(rootURL.path + "/") {
+                rootIsUnreadable = true
+            } else {
+                unreadablePrefixes.append(relativePath(for: failure.url))
+            }
+        }
+        let (shieldedDocumentIDs, deletedDocumentIDs): ([String], [String])
+        if rootIsUnreadable {
+            (shieldedDocumentIDs, deletedDocumentIDs) = (missingDocumentIDs, [])
+        } else {
+            (shieldedDocumentIDs, deletedDocumentIDs) = try partitionShielded(
+                missingDocumentIDs,
+                unreadablePrefixes: unreadablePrefixes,
+                checkCancellation: checkCancellation
+            )
+        }
 
         let previousFingerprints = previousCursor?.fileFingerprints ?? [:]
         // Shielded documents stay in the cursor with their last known fingerprints:
@@ -145,6 +188,7 @@ public struct LocalFileConnector: SourceConnector {
         // and files deleted in the interim are still detected.
         var cursorFingerprints = currentFingerprints
         for documentID in shieldedDocumentIDs {
+            try checkCancellation()
             // An unknown previous fingerprint still keeps the document tracked (empty
             // sentinel): it re-upserts once the subtree is readable again instead of
             // silently dropping out of delete detection.
@@ -152,42 +196,56 @@ public struct LocalFileConnector: SourceConnector {
         }
         let currentCursor = LocalFileCursor(
             rootPath: rootURL.path,
-            fingerprint: fingerprint(for: payloads),
+            fingerprint: try fingerprint(for: payloads, checkCancellation: checkCancellation),
             fileFingerprints: cursorFingerprints
         )
         let nextCursor = try currentCursor.encoded()
+        try checkCancellation()
         let rootMoved = previousCursor.map { $0.rootPath != rootURL.path } ?? false
         let changedPayloads: [SourcePayload]
         if previousCursor == nil || rootMoved || previousFingerprints.isEmpty {
             changedPayloads = payloads
         } else {
-            changedPayloads = payloads.filter { payload in
-                previousFingerprints[payload.documentID.rawValue] != currentFingerprints[payload.documentID.rawValue]
+            var changed: [SourcePayload] = []
+            for payload in payloads {
+                try checkCancellation()
+                if previousFingerprints[payload.documentID.rawValue] != currentFingerprints[payload.documentID.rawValue] {
+                    changed.append(payload)
+                }
             }
+            changedPayloads = changed
         }
         let hasChanges = !deletedDocumentIDs.isEmpty || !changedPayloads.isEmpty || !shieldedDocumentIDs.isEmpty
         // Every unreadable path is reported, even when it shields no indexed
         // documents (e.g. a subtree created unreadable after the last sync) —
         // a partial walk must stay visible, not just non-destructive.
-        let unavailablePaths = scan.unreadable
-            .map { (path: relativePath(for: $0.url), reason: $0.reason) }
-            .sorted { $0.path < $1.path }
+        var unavailablePaths: [(path: String, reason: String)] = []
+        for failure in scan.unreadable {
+            try checkCancellation()
+            unavailablePaths.append((path: relativePath(for: failure.url), reason: failure.reason))
+        }
+        unavailablePaths.sort { $0.path < $1.path }
 
         for entry in unavailablePaths {
+            try checkCancellation()
             continuation.yield(.pathUnavailable(path: entry.path, reason: entry.reason))
         }
         if hasChanges {
             for documentID in deletedDocumentIDs.sorted() {
+                try checkCancellation()
                 continuation.yield(.delete(documentID: EngineID(rawValue: documentID)))
             }
             for documentID in shieldedDocumentIDs.sorted() {
+                try checkCancellation()
                 continuation.yield(.permissionChanged(documentID: EngineID(rawValue: documentID)))
             }
             for payload in changedPayloads {
+                try checkCancellation()
                 continuation.yield(.upsert(payload))
             }
         }
 
+        try checkCancellation()
         continuation.yield(.checkpoint(nextCursor))
     }
 
@@ -195,13 +253,15 @@ public struct LocalFileConnector: SourceConnector {
     /// path (kept, reported as permission changes) and true deletions.
     private func partitionShielded(
         _ missingDocumentIDs: [String],
-        unreadablePrefixes: [String]
-    ) -> (shielded: [String], deleted: [String]) {
+        unreadablePrefixes: [String],
+        checkCancellation: () throws -> Void
+    ) throws -> (shielded: [String], deleted: [String]) {
         guard !unreadablePrefixes.isEmpty else { return ([], missingDocumentIDs) }
         let idPrefix = "\(id.rawValue):"
         var shielded: [String] = []
         var deleted: [String] = []
         for documentID in missingDocumentIDs {
+            try checkCancellation()
             let relative = documentID.hasPrefix(idPrefix)
                 ? String(documentID.dropFirst(idPrefix.count))
                 : documentID
@@ -242,7 +302,7 @@ public struct LocalFileConnector: SourceConnector {
         return try payload(for: url)
     }
 
-    private struct ScanResult {
+    struct ScanResult {
         var payloads: [SourcePayload]
         var unreadable: [(url: URL, reason: String)]
     }
@@ -252,10 +312,13 @@ public struct LocalFileConnector: SourceConnector {
         var reason: String
     }
 
-    private func scanPayloads() throws -> ScanResult {
+    func scanPayloads(checkCancellation: () throws -> Void) throws -> ScanResult {
+        try checkCancellation()
         let values = try rootURL.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
         if values.isRegularFile == true {
-            return ScanResult(payloads: [try payload(for: rootURL)], unreadable: [])
+            let payload = try payload(for: rootURL)
+            try checkCancellation()
+            return ScanResult(payloads: [payload], unreadable: [])
         }
 
         guard values.isDirectory == true else {
@@ -292,6 +355,7 @@ public struct LocalFileConnector: SourceConnector {
 
         var payloads: [SourcePayload] = []
         for case let url as URL in enumerator {
+            try checkCancellation()
             do {
                 guard let payload = try payloadIfSupported(url.standardizedFileURL) else { continue }
                 payloads.append(payload)
@@ -300,6 +364,7 @@ public struct LocalFileConnector: SourceConnector {
             }
         }
 
+        try checkCancellation()
         payloads.sort { $0.documentID.rawValue < $1.documentID.rawValue }
         return ScanResult(payloads: payloads, unreadable: unreadable)
     }
@@ -310,6 +375,7 @@ public struct LocalFileConnector: SourceConnector {
         .isHiddenKey,
         .fileSizeKey,
         .contentModificationDateKey,
+        .attributeModificationDateKey,
         .contentTypeKey
     ]
 
@@ -382,6 +448,9 @@ public struct LocalFileConnector: SourceConnector {
         if let modified = values.contentModificationDate {
             metadata["modifiedAt"] = .double(modified.timeIntervalSince1970)
         }
+        if let attributesModified = values.attributeModificationDate {
+            metadata["attributesModifiedAt"] = .double(attributesModified.timeIntervalSince1970)
+        }
 
         return SourcePayload(
             documentID: EngineID(rawValue: "\(id.rawValue):\(relativePath)"),
@@ -451,6 +520,7 @@ public struct LocalFileConnector: SourceConnector {
 
     private func fileFingerprint(for payload: SourcePayload) -> String {
         var hasher = StableFNV1A()
+        hasher.update("local-file-v3")
         hasher.update(payload.documentID.rawValue)
         if case let .integer(size)? = payload.metadata["fileSize"] {
             hasher.update(String(size))
@@ -458,21 +528,46 @@ public struct LocalFileConnector: SourceConnector {
         if case let .double(modifiedAt)? = payload.metadata["modifiedAt"] {
             hasher.update(String(modifiedAt.bitPattern))
         }
+        if case let .double(attributesModifiedAt)? = payload.metadata["attributesModifiedAt"] {
+            hasher.update(String(attributesModifiedAt.bitPattern))
+        }
         return String(hasher.value, radix: 16)
     }
 
-    private func fingerprint(for payloads: [SourcePayload]) -> String {
+    private func fingerprint(
+        for payloads: [SourcePayload],
+        checkCancellation: () throws -> Void
+    ) throws -> String {
         var hasher = StableFNV1A()
         hasher.update(rootURL.path)
-        for payload in payloads.sorted(by: { $0.documentID.rawValue < $1.documentID.rawValue }) {
+        // `scanPayloads` establishes document-ID order before returning.
+        for payload in payloads {
+            try checkCancellation()
             hasher.update(fileFingerprint(for: payload))
         }
         return "\(payloads.count)|\(String(hasher.value, radix: 16))"
     }
 }
 
+final class LocalFileScanCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isCancelled = false
+
+    func cancel() {
+        lock.withLock {
+            isCancelled = true
+        }
+    }
+
+    func check() throws {
+        if lock.withLock({ isCancelled }) {
+            throw CancellationError()
+        }
+    }
+}
+
 private struct LocalFileCursor: Codable, Hashable, Sendable {
-    static let currentVersion = 2
+    static let currentVersion = 3
 
     var version: Int = currentVersion
     var rootPath: String
@@ -553,4 +648,3 @@ private extension Data {
             .replacing("=", with: "")
     }
 }
-

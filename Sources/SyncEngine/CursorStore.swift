@@ -9,8 +9,9 @@ public protocol CursorStore: Sendable {
     func setCursor(_ cursor: SourceCursor, forKey key: String)
 }
 
-/// Persists all cursors as one dictionary under a single defaults key. UserDefaults is
-/// internally thread-safe, hence the unchecked conformance.
+/// Persists each cursor under an independent encoded defaults key, so updates for different
+/// sources are single writes rather than a shared dictionary read-modify-write. Legacy
+/// dictionary entries remain readable for stores created by earlier releases.
 public final class UserDefaultsCursorStore: CursorStore, @unchecked Sendable {
     private let defaults: UserDefaults
     private let storageKey: String
@@ -21,12 +22,18 @@ public final class UserDefaultsCursorStore: CursorStore, @unchecked Sendable {
     }
 
     public func cursor(forKey key: String) -> SourceCursor? {
-        (defaults.dictionary(forKey: storageKey) as? [String: SourceCursor])?[key]
+        if let cursor = defaults.string(forKey: entryStorageKey(for: key)) {
+            return cursor
+        }
+        return (defaults.dictionary(forKey: storageKey) as? [String: SourceCursor])?[key]
     }
 
     public func setCursor(_ cursor: SourceCursor, forKey key: String) {
-        var cursors = defaults.dictionary(forKey: storageKey) as? [String: SourceCursor] ?? [:]
-        cursors[key] = cursor
-        defaults.set(cursors, forKey: storageKey)
+        defaults.set(cursor, forKey: entryStorageKey(for: key))
+    }
+
+    private func entryStorageKey(for key: String) -> String {
+        let encodedKey = Data(key.utf8).base64EncodedString()
+        return "\(storageKey).cursor.v1.\(encodedKey)"
     }
 }

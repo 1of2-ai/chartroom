@@ -445,6 +445,91 @@ struct WorkspaceLifecycleTests {
         )
     }
 
+    @Test("deleting an adopted index refuses a replacement SQLite sidecar")
+    func deleteAdoptedSidecarReplacementDoesNotDeleteIt() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let adoptedStore = root.appending(path: "IndexEngine.sqlite")
+        let storeContents = Data("original adopted store".utf8)
+        try storeContents.write(to: adoptedStore)
+        let walURL = URL(filePath: adoptedStore.path + "-wal")
+        try Data("original wal".utf8).write(to: walURL)
+        try Data("original shm".utf8).write(
+            to: URL(filePath: adoptedStore.path + "-shm")
+        )
+        let adopted = ChartroomIndex(name: "Adopted Sidecar", storeURL: adoptedStore)
+        let workspace = makeWorkspace(root: root, bootstrapIndexes: [adopted])
+        _ = try await workspace.indexes()
+
+        let displacedWAL = root.appending(path: "Displaced.sqlite-wal")
+        try FileManager.default.moveItem(at: walURL, to: displacedWAL)
+        let replacementContents = Data("replacement wal must survive".utf8)
+        try replacementContents.write(to: walURL)
+
+        do {
+            _ = try await workspace.deleteIndex(adopted.id)
+            Issue.record("Expected cleanup to refuse a replacement adopted-store sidecar")
+        } catch let error as IndexEngineError {
+            #expect(error.code == "chartroom.workspace.store-delete-failed")
+        }
+
+        #expect(try Data(contentsOf: adoptedStore) == storeContents)
+        #expect(try Data(contentsOf: walURL) == replacementContents)
+        #expect(FileManager.default.fileExists(atPath: displacedWAL.path))
+    }
+
+    @Test("deleting an adopted index leaves a directory masquerading as a sidecar untouched")
+    func deleteAdoptedSidecarDirectoryDoesNotDetachIt() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let adoptedStore = root.appending(path: "IndexEngine.sqlite")
+        let storeContents = Data("original adopted store".utf8)
+        try storeContents.write(to: adoptedStore)
+        let walURL = URL(filePath: adoptedStore.path + "-wal", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: walURL, withIntermediateDirectories: false)
+        let markerURL = walURL.appending(path: "must-survive")
+        try Data("marker".utf8).write(to: markerURL)
+        let adopted = ChartroomIndex(name: "Adopted Sidecar Directory", storeURL: adoptedStore)
+        let workspace = makeWorkspace(root: root, bootstrapIndexes: [adopted])
+        _ = try await workspace.indexes()
+
+        do {
+            _ = try await workspace.deleteIndex(adopted.id)
+            Issue.record("Expected cleanup to refuse a directory masquerading as a sidecar")
+        } catch let error as IndexEngineError {
+            #expect(error.code == "chartroom.workspace.store-delete-failed")
+        }
+
+        #expect(try Data(contentsOf: adoptedStore) == storeContents)
+        #expect(FileManager.default.fileExists(atPath: markerURL.path))
+    }
+
+    @Test("deleting an adopted index refuses a late SQLite sidecar before deleting its store")
+    func deleteAdoptedLateSidecarDoesNotPartiallyDeleteStore() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let adoptedStore = root.appending(path: "IndexEngine.sqlite")
+        let storeContents = Data("bound adopted store must survive".utf8)
+        try storeContents.write(to: adoptedStore)
+        let adopted = ChartroomIndex(name: "Adopted Late Sidecar", storeURL: adoptedStore)
+        let workspace = makeWorkspace(root: root, bootstrapIndexes: [adopted])
+        _ = try await workspace.indexes()
+
+        let walURL = URL(filePath: adoptedStore.path + "-wal")
+        let walContents = Data("never-bound wal must survive".utf8)
+        try walContents.write(to: walURL)
+
+        do {
+            _ = try await workspace.deleteIndex(adopted.id)
+            Issue.record("Expected cleanup to refuse a sidecar created after binding")
+        } catch let error as IndexEngineError {
+            #expect(error.code == "chartroom.workspace.store-delete-failed")
+        }
+
+        #expect(try Data(contentsOf: adoptedStore) == storeContents)
+        #expect(try Data(contentsOf: walURL) == walContents)
+    }
+
     @Test("deleting an adopted index stays bound when its parent is replaced")
     func deleteAdoptedIndexUsesBoundParentDirectory() async throws {
         let root = try temporaryRoot()
@@ -602,7 +687,7 @@ struct WorkspaceLifecycleTests {
 
         let openTask = Task { try await session.open() }
         try await factoryGate.waitUntilEntered()
-        await session.close()
+        try await session.close()
         #expect(await session.status().state == .unopened)
 
         await factoryGate.release()

@@ -105,12 +105,15 @@ public struct IndexStoreCounts: Sendable, Equatable {
 }
 
 public enum IndexStoreError: Error, CustomStringConvertible, Equatable {
+    case embeddingBatchCountMismatch(kind: EmbedKind, expected: Int, actual: Int)
     case embeddingDimensionMismatch(kind: EmbedKind, expected: Int, actual: Int)
     case embeddingSpaceMismatch(expected: String, actual: String)
     case storedVectorDimensionMismatch(id: String, expected: Int, actual: Int)
 
     public var description: String {
         switch self {
+        case let .embeddingBatchCountMismatch(kind, expected, actual):
+            "Embedding batch count mismatch for \(kind): expected \(expected), got \(actual)"
         case let .embeddingDimensionMismatch(kind, expected, actual):
             "Embedding dimension mismatch for \(kind): expected \(expected), got \(actual)"
         case let .embeddingSpaceMismatch(expected, actual):
@@ -140,6 +143,7 @@ public actor IndexStore {
 
     /// Confirmed-available probe result; see `embeddingProviderStatus()`.
     var cachedEmbeddingProviderStatus: (isAvailable: Bool, message: String)?
+    var embeddingSpaceCoverageReader: (@Sendable () throws -> EmbeddingSpaceCoverage)?
     /// The `k` constant in the reciprocal-rank-fusion weight `1 / (k + rank)`. Public so the
     /// engine can report its real fusion parameter through `RetrievalPipelineDescriptor`
     /// rather than the GUI hardcoding a copy that could drift.
@@ -168,9 +172,34 @@ public actor IndexStore {
         db.fileByteSize
     }
 
+    func replaceEmbeddingSpaceCoverageReader(
+        _ reader: (@Sendable () throws -> EmbeddingSpaceCoverage)?
+    ) {
+        embeddingSpaceCoverageReader = reader
+    }
+
+    func observeSQLiteStatementPreparations(
+        _ observer: (@Sendable (String) -> Void)?
+    ) {
+        db.observeStatementPreparations(observer)
+    }
+
     func validateEmbedding(_ vector: [Float], kind: EmbedKind) throws {
         guard vector.count == dimension else {
             throw IndexStoreError.embeddingDimensionMismatch(kind: kind, expected: dimension, actual: vector.count)
+        }
+    }
+
+    func validateEmbeddingBatch(_ vectors: [[Float]], expectedCount: Int, kind: EmbedKind) throws {
+        guard vectors.count == expectedCount else {
+            throw IndexStoreError.embeddingBatchCountMismatch(
+                kind: kind,
+                expected: expectedCount,
+                actual: vectors.count
+            )
+        }
+        for vector in vectors {
+            try validateEmbedding(vector, kind: kind)
         }
     }
 

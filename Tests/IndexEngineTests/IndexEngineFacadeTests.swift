@@ -434,6 +434,107 @@ struct IndexEngineFacadeTests {
         #expect(await engine.failures(limit: 10).isEmpty)
     }
 
+    @Test("a failed durable clear preserves recent failure diagnostics")
+    func failedDurableClearPreservesRecentFailures() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("failed-clear-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: path) }
+        let engine = try await IndexEngine.open(
+            storeURL: path,
+            configuration: .init(embedder: ThrowingEmbedder())
+        )
+
+        _ = try? await engine.ingest(.init(
+            payloads: [SourcePayload(
+                documentID: "diagnostic-must-survive",
+                sourceID: "fixture-source",
+                displayName: "Failure",
+                body: .text("fails at embedding time")
+            )]
+        ))
+        let recorded = try #require(
+            await engine.failures(limit: 10).first { $0.documentID == "diagnostic-must-survive" }
+        )
+
+        let db = try SQLite(path: path.path)
+        try db.exec("DROP TABLE failures")
+
+        await #expect(throws: (any Error).self) {
+            try await engine.clearFailures(ids: [recorded.id])
+        }
+        #expect(
+            await engine.failures(limit: 10).contains {
+                $0.documentID == "diagnostic-must-survive"
+            }
+        )
+    }
+
+    @Test("diagnostic history keeps jobs available when the failure table is unavailable")
+    func diagnosticHistorySeparatesFailureTableAvailability() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("unavailable-failure-history-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: path) }
+        let seedEngine = try await IndexEngine.open(
+            storeURL: path,
+            configuration: .init(embedder: ThrowingEmbedder())
+        )
+        _ = try? await seedEngine.ingest(.init(
+            payloads: [SourcePayload(
+                documentID: "history-document",
+                sourceID: "history-source",
+                displayName: "History",
+                body: .text("fails and remains in recent diagnostics")
+            )],
+            jobID: "history-job"
+        ))
+
+        let reopenedEngine = try await IndexEngine.open(
+            storeURL: path,
+            configuration: .init(embedder: ThrowingEmbedder())
+        )
+        let db = try SQLite(path: path.path)
+        try db.exec("DROP TABLE failures")
+
+        let history = await reopenedEngine.diagnosticHistory(limit: 10)
+        #expect(history.failuresAvailability == .unavailable)
+        #expect(history.jobsAvailability == .available)
+        #expect(history.failures.isEmpty)
+        #expect(history.jobs.contains { $0.id == "history-job" })
+    }
+
+    @Test("diagnostic history keeps failures available when the job table is unavailable")
+    func diagnosticHistorySeparatesJobTableAvailability() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("unavailable-job-history-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: path) }
+        let seedEngine = try await IndexEngine.open(
+            storeURL: path,
+            configuration: .init(embedder: ThrowingEmbedder())
+        )
+        _ = try? await seedEngine.ingest(.init(
+            payloads: [SourcePayload(
+                documentID: "history-document",
+                sourceID: "history-source",
+                displayName: "History",
+                body: .text("fails and remains in recent diagnostics")
+            )],
+            jobID: "history-job"
+        ))
+
+        let reopenedEngine = try await IndexEngine.open(
+            storeURL: path,
+            configuration: .init(embedder: ThrowingEmbedder())
+        )
+        let db = try SQLite(path: path.path)
+        try db.exec("DROP TABLE jobs")
+
+        let history = await reopenedEngine.diagnosticHistory(limit: 10)
+        #expect(history.failuresAvailability == .available)
+        #expect(history.jobsAvailability == .unavailable)
+        #expect(history.failures.contains { $0.documentID == "history-document" })
+        #expect(history.jobs.isEmpty)
+    }
+
     @Test("cancelled ingestion records a cancelled job without durable item failures")
     func cancelledIngestionIsNotRecordedAsEmbeddingFailures() async throws {
         let engine = try await IndexEngine.openInMemory(

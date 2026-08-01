@@ -117,6 +117,7 @@ struct EmbeddingSpaceIsolationTests {
         let afterSwap = try await swapped.searchDetailed("thermal throttling", limit: 5)
         #expect(afterSwap.diagnostics.embeddingSpaceMismatch)
         #expect(afterSwap.diagnostics.degraded)
+        #expect(afterSwap.diagnostics.embeddingSpaceCoverageState == .orphaned)
     }
 
     /// Detecting the orphan is only half of C3 — without a rebuild there is no way back, because
@@ -174,6 +175,7 @@ struct EmbeddingSpaceIsolationTests {
 
         #expect(response.hits.isEmpty)
         #expect(response.diagnostics.embeddingSpaceMismatch == false)
+        #expect(response.diagnostics.embeddingSpaceCoverageState == .notOrphaned)
         #expect(try await store.embeddingSpaceCoverage().isOrphaned == false)
     }
 

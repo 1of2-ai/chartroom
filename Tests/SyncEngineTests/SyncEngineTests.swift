@@ -184,6 +184,192 @@ struct SyncOrchestratorTests {
         #expect(store.cursor(forKey: "key") == nil)
     }
 
+    @Test("cancelling a paused sync wakes it and holds the cursor")
+    func cancellingPausedRunWakesAndHaltsIt() async throws {
+        let engine = ScriptedEngine()
+        let store = InMemoryCursorStore()
+        store.setCursor("cursor-before", forKey: "key")
+        let orchestrator = SyncOrchestrator(engine: engine, cursorStore: store)
+        let control = SyncControl()
+        control.pause()
+        let connector = ScriptedConnector(events: [
+            .upsert(Self.payload("doc-0")),
+            .checkpoint("cursor-after-cancel"),
+        ])
+        let completion = CompletionRecorder()
+
+        let syncTask = Task {
+            do {
+                let outcome = try await orchestrator.sync(
+                    connector: connector,
+                    cursorKey: "key",
+                    control: control
+                )
+                await completion.markCompleted()
+                return outcome
+            } catch {
+                await completion.markCompleted()
+                throw error
+            }
+        }
+
+        let clock = ContinuousClock()
+        let startDeadline = clock.now.advanced(by: .seconds(1))
+        while connector.receivedCursor() != "cursor-before", clock.now < startDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(connector.receivedCursor() == "cursor-before")
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await engine.recordedCalls().isEmpty)
+
+        syncTask.cancel()
+        let cancellationDeadline = clock.now.advanced(by: .seconds(1))
+        while !(await completion.hasCompleted()), clock.now < cancellationDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let completedWithoutRescue = await completion.hasCompleted()
+        if !completedWithoutRescue {
+            control.stop()
+        }
+        let outcome = try await syncTask.value
+
+        #expect(completedWithoutRescue, "Cancellation must resume a task parked by pause")
+        #expect(outcome.stopped)
+        #expect(outcome.accepted == 0)
+        #expect(outcome.newCursor == nil)
+        #expect(store.cursor(forKey: "key") == "cursor-before")
+    }
+
+    @Test("stopping while connector collection is blocked cancels collection and holds the cursor")
+    func stoppingBlockedCollectionCancelsIt() async throws {
+        let engine = ScriptedEngine()
+        let store = InMemoryCursorStore()
+        store.setCursor("cursor-before", forKey: "key")
+        let orchestrator = SyncOrchestrator(engine: engine, cursorStore: store)
+        let connector = BlockingConnector()
+        let control = SyncControl()
+        let completion = CompletionRecorder()
+
+        let syncTask = Task {
+            let outcome = try await orchestrator.sync(
+                connector: connector,
+                cursorKey: "key",
+                control: control
+            )
+            await completion.markCompleted()
+            return outcome
+        }
+
+        let clock = ContinuousClock()
+        let startDeadline = clock.now.advanced(by: .seconds(1))
+        while !connector.hasStarted, clock.now < startDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(connector.hasStarted)
+
+        control.stop()
+        let stopDeadline = clock.now.advanced(by: .seconds(1))
+        while !(await completion.hasCompleted()), clock.now < stopDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let completedWithoutRescue = await completion.hasCompleted()
+        if !completedWithoutRescue {
+            connector.finish()
+        }
+        let outcome = try await syncTask.value
+
+        #expect(completedWithoutRescue, "Stop must cancel connector collection instead of waiting for its next event")
+        #expect(connector.wasCancelled)
+        #expect(outcome.stopped)
+        #expect(outcome.newCursor == nil)
+        #expect(store.cursor(forKey: "key") == "cursor-before")
+        #expect(await engine.recordedCalls().isEmpty)
+    }
+
+    @Test("cancelling while connector collection is blocked returns a stopped outcome")
+    func cancellingBlockedCollectionStopsRun() async throws {
+        let engine = ScriptedEngine()
+        let store = InMemoryCursorStore()
+        store.setCursor("cursor-before", forKey: "key")
+        let orchestrator = SyncOrchestrator(engine: engine, cursorStore: store)
+        let connector = BlockingConnector()
+        let completion = CompletionRecorder()
+
+        let syncTask = Task {
+            let outcome = try await orchestrator.sync(
+                connector: connector,
+                cursorKey: "key"
+            )
+            await completion.markCompleted()
+            return outcome
+        }
+
+        let clock = ContinuousClock()
+        let startDeadline = clock.now.advanced(by: .seconds(1))
+        while !connector.hasStarted, clock.now < startDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(connector.hasStarted)
+
+        syncTask.cancel()
+        let cancellationDeadline = clock.now.advanced(by: .seconds(1))
+        while !(await completion.hasCompleted()), clock.now < cancellationDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let completedWithoutRescue = await completion.hasCompleted()
+        if !completedWithoutRescue {
+            connector.finish()
+        }
+        let outcome = try await syncTask.value
+
+        #expect(completedWithoutRescue, "Cancellation must terminate connector collection")
+        #expect(connector.wasCancelled)
+        #expect(outcome.stopped)
+        #expect(outcome.newCursor == nil)
+        #expect(store.cursor(forKey: "key") == "cursor-before")
+        #expect(await engine.recordedCalls().isEmpty)
+    }
+
+    @Test("pause gates deletion and cursor advancement after connector collection")
+    func pauseGatesDeletionAndCursorAdvancement() async throws {
+        let engine = ScriptedEngine()
+        let store = InMemoryCursorStore()
+        store.setCursor("cursor-before", forKey: "key")
+        let orchestrator = SyncOrchestrator(engine: engine, cursorStore: store)
+        let connector = ScriptedConnector(events: [
+            .delete(documentID: "doc-gone"),
+            .checkpoint("cursor-after"),
+        ])
+        let control = SyncControl()
+        control.pause()
+
+        let syncTask = Task {
+            try await orchestrator.sync(
+                connector: connector,
+                cursorKey: "key",
+                control: control
+            )
+        }
+
+        let clock = ContinuousClock()
+        let collectionDeadline = clock.now.advanced(by: .seconds(1))
+        while connector.receivedCursor() != "cursor-before", clock.now < collectionDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let callsWhilePaused = await engine.recordedCalls()
+        let cursorWhilePaused = store.cursor(forKey: "key")
+
+        control.resume()
+        let outcome = try await syncTask.value
+
+        #expect(callsWhilePaused.isEmpty)
+        #expect(cursorWhilePaused == "cursor-before")
+        #expect(outcome.deletedCount == 1)
+        #expect(outcome.newCursor == "cursor-after")
+        #expect(store.cursor(forKey: "key") == "cursor-after")
+    }
+
     @Test("progress reports the payload total and the item being ingested")
     func progressReportsTotalsAndCurrentItem() async throws {
         let engine = ScriptedEngine()
@@ -237,6 +423,53 @@ struct UserDefaultsCursorStoreTests {
         #expect(second.cursor(forKey: "source-a") == "cursor-a")
         #expect(second.cursor(forKey: "source-b") == "cursor-b")
         #expect(second.cursor(forKey: "source-c") == nil)
+    }
+
+    @Test("concurrent writes to different cursor keys cannot overwrite one another")
+    func concurrentWritesPreserveBothKeys() throws {
+        let suiteName = "SyncEngineTests-\(UUID().uuidString)"
+        let defaults = try #require(CoordinatedDictionaryReadUserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = UserDefaultsCursorStore(defaults: defaults, storageKey: "cursors")
+        let writes = DispatchGroup()
+        let queue = DispatchQueue(label: "SyncEngineTests.cursor-writes", attributes: .concurrent)
+
+        writes.enter()
+        queue.async {
+            store.setCursor("cursor-a", forKey: "source-a")
+            writes.leave()
+        }
+        writes.enter()
+        queue.async {
+            store.setCursor("cursor-b", forKey: "source-b")
+            writes.leave()
+        }
+
+        let completedWithoutRescue = writes.wait(timeout: .now() + 1) == .success
+        if !completedWithoutRescue {
+            defaults.releaseBlockedReads()
+            writes.wait()
+        }
+
+        #expect(completedWithoutRescue)
+        #expect(store.cursor(forKey: "source-a") == "cursor-a")
+        #expect(store.cursor(forKey: "source-b") == "cursor-b")
+    }
+
+    @Test("per-key cursor storage still reads legacy dictionary entries")
+    func perKeyStorageReadsLegacyDictionary() throws {
+        let suiteName = "SyncEngineTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(["source": "cursor-legacy"], forKey: "cursors")
+        let store = UserDefaultsCursorStore(defaults: defaults, storageKey: "cursors")
+
+        #expect(store.cursor(forKey: "source") == "cursor-legacy")
+
+        store.setCursor("cursor-current", forKey: "source")
+        #expect(store.cursor(forKey: "source") == "cursor-current")
     }
 }
 
@@ -325,6 +558,60 @@ private final class ScriptedConnector: SourceConnector, @unchecked Sendable {
     }
 }
 
+private final class BlockingConnector: SourceConnector, @unchecked Sendable {
+    let id: ConnectorID = "blocking"
+    let capabilities = ConnectorCapabilities(supportsIncrementalSync: true, supportsRuntimeTools: false)
+
+    private let lock = NSLock()
+    private var continuation: AsyncThrowingStream<SourceEvent, Error>.Continuation?
+    private var started = false
+    private var cancelled = false
+
+    var hasStarted: Bool {
+        lock.withLock { started }
+    }
+
+    var wasCancelled: Bool {
+        lock.withLock { cancelled }
+    }
+
+    func validate() async throws {}
+
+    func changes(since cursor: SourceCursor?) async throws -> AsyncThrowingStream<SourceEvent, Error> {
+        AsyncThrowingStream { continuation in
+            lock.withLock {
+                self.continuation = continuation
+                started = true
+            }
+            continuation.onTermination = { [weak self] termination in
+                guard case .cancelled = termination else { return }
+                self?.lock.withLock {
+                    self?.cancelled = true
+                    self?.continuation = nil
+                }
+            }
+        }
+    }
+
+    func finish() {
+        let continuation = lock.withLock {
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.finish()
+    }
+
+    func fetch(_ reference: SourceReference) async throws -> SourcePayload {
+        SourcePayload(
+            documentID: EngineID(rawValue: reference.externalID ?? reference.uri.lastPathComponent),
+            sourceID: id,
+            sourceURI: reference.uri,
+            displayName: reference.uri.lastPathComponent,
+            body: .binaryReference(reference.uri)
+        )
+    }
+}
+
 private final class InMemoryCursorStore: CursorStore, @unchecked Sendable {
     private let lock = NSLock()
     private var cursors: [String: SourceCursor] = [:]
@@ -338,6 +625,33 @@ private final class InMemoryCursorStore: CursorStore, @unchecked Sendable {
     }
 }
 
+private final class CoordinatedDictionaryReadUserDefaults: UserDefaults, @unchecked Sendable {
+    private let condition = NSCondition()
+    private var readCount = 0
+    private var readsReleased = false
+
+    override func dictionary(forKey defaultName: String) -> [String: Any]? {
+        condition.lock()
+        readCount += 1
+        if readCount == 2 {
+            readsReleased = true
+            condition.broadcast()
+        }
+        while !readsReleased {
+            condition.wait()
+        }
+        condition.unlock()
+        return super.dictionary(forKey: defaultName)
+    }
+
+    func releaseBlockedReads() {
+        condition.lock()
+        readsReleased = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
 private actor ProgressRecorder {
     private var recorded: [SyncProgressUpdate] = []
 
@@ -347,6 +661,18 @@ private actor ProgressRecorder {
 
     func updates() -> [SyncProgressUpdate] {
         recorded
+    }
+}
+
+private actor CompletionRecorder {
+    private var completed = false
+
+    func markCompleted() {
+        completed = true
+    }
+
+    func hasCompleted() -> Bool {
+        completed
     }
 }
 
