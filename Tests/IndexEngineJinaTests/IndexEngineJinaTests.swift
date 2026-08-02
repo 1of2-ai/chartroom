@@ -34,6 +34,78 @@ struct IndexEngineJinaTests {
         #expect(JinaModelBundleLocator.isValidBundle(tmp) == false)
     }
 
+    @Test("staging a tokenizer folder with a missing artifact throws instead of creating dangling links")
+    func stagingRejectsMissingTokenizerArtifacts() throws {
+        let bundleURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("staging-missing-\(UUID().uuidString)", isDirectory: true)
+        let tokenizerDirectory = bundleURL.appendingPathComponent("tok", isDirectory: true)
+        try FileManager.default.createDirectory(at: tokenizerDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bundleURL) }
+
+        var manifest = JinaModelBundle.Manifest.default
+        manifest.text.tokenizer = "tok"
+        try JSONEncoder().encode(manifest).write(to: bundleURL.appendingPathComponent("manifest.json"))
+        // tokenizer.json exists; tokenizer_config.json is missing.
+        try Data("{}".utf8).write(to: tokenizerDirectory.appendingPathComponent("tokenizer.json"))
+
+        let bundle = try JinaModelBundle(url: bundleURL)
+        #expect(throws: (any Error).self) {
+            _ = try JinaTokenizerStaging.resolvedFolder(for: bundle)
+        }
+    }
+
+    @Test("manifest formatting does not change the embedding space")
+    func manifestFormattingDoesNotChangeEmbeddingSpace() throws {
+        let manifest = JinaModelBundle.Manifest.default
+        let compact = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fingerprint-compact-\(UUID().uuidString)", isDirectory: true)
+        let pretty = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fingerprint-pretty-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: compact, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: pretty, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: compact)
+            try? FileManager.default.removeItem(at: pretty)
+        }
+
+        let compactEncoder = JSONEncoder()
+        try compactEncoder.encode(manifest).write(to: compact.appendingPathComponent("manifest.json"))
+        let prettyEncoder = JSONEncoder()
+        prettyEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try prettyEncoder.encode(manifest).write(to: pretty.appendingPathComponent("manifest.json"))
+
+        let compactBundle = try JinaModelBundle(url: compact)
+        let prettyBundle = try JinaModelBundle(url: pretty)
+        // Same decoded manifest, different bytes on disk: one embedding space, not two.
+        #expect(compactBundle.embeddingSpaceID == prettyBundle.embeddingSpaceID)
+        // And the manifest-constructed path agrees with the file-loaded path.
+        let constructed = JinaModelBundle(rootDirectory: compact, manifest: manifest)
+        #expect(constructed.embeddingSpaceID == compactBundle.embeddingSpaceID)
+    }
+
+    @Test(
+        "an oversized raw image is rejected as tooLarge, not noOutput",
+        .enabled(if: IndexEngineJinaTests.repoBundle != nil)
+    )
+    func oversizedRawImageThrowsTooLarge() throws {
+        let bundleURL = try #require(Self.repoBundle)
+        let bundle = try JinaModelBundle(url: bundleURL)
+        let embedder = try JinaImageEmbedderMasked(
+            visionModelURL: bundle.resolve(bundle.manifest.image.encoder),
+            embedModelURL: bundle.resolve(bundle.manifest.decoder.embed),
+            decoderModelURL: bundle.resolve(bundle.manifest.decoder.model),
+            resourcesDir: bundle.resolve(bundle.manifest.image.resources)
+        )
+        // 1024x1024 → a 64x64 patch grid (4096) over the 4032 bucket ceiling.
+        let rgb = [UInt8](repeating: 128, count: 1024 * 1024 * 3)
+        do {
+            _ = try embedder.embed(rgb: rgb, h: 1024, w: 1024)
+            Issue.record("expected an oversized image to throw")
+        } catch VisionCoreMLEncoderMasked.EncoderError.tooLarge {
+            // The purpose-built case: hosts catch it to downscale and retry.
+        }
+    }
+
     @Test("locator rejects a bundle whose vision resources folder is missing the files the towers load")
     func locatorRejectsIncompleteVisionResources() throws {
         let tmp = FileManager.default.temporaryDirectory

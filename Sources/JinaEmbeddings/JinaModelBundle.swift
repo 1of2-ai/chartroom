@@ -31,7 +31,10 @@ public struct JinaModelBundle: Sendable {
                 actual: manifest.formatVersion
             )
         }
-        self.init(rootDirectory: url, manifest: manifest, manifestFingerprint: Self.fingerprint(for: manifestData))
+        // Fingerprint the decoded manifest, not the file's bytes: formatting is not
+        // identity, and the manifest-constructed initializers must land in the same
+        // embedding space as the file-loaded one.
+        self.init(rootDirectory: url, manifest: manifest, manifestFingerprint: Self.fingerprint(for: manifest))
     }
 
     /// Compatibility constructor for directories that use the default artifact names but do not yet
@@ -55,7 +58,15 @@ public struct JinaModelBundle: Sendable {
     }
 
     private static func fingerprint(for manifest: Manifest) -> String {
-        let data = (try? JSONEncoder().encode(manifest)) ?? Data()
+        // Sorted keys make the encode deterministic across processes; a plain
+        // JSONEncoder's key order is not, which turned the space ID into a coin flip.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(manifest) else {
+            // Unreachable for a plain Codable struct; a sentinel beats hashing empty
+            // Data, which would masquerade as a legitimate fingerprint.
+            return "unencodable"
+        }
         return fingerprint(for: data)
     }
 

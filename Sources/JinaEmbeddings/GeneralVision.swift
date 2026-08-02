@@ -264,7 +264,7 @@ public final class JinaImageEmbedderMasked: @unchecked Sendable {
     /// Requires (h/16)*(w/16) ≤ maxPatches; use `embed(imageURL:)` for arbitrary sizes (it downscales).
     public func embed(rgb: [UInt8], h: Int, w: Int, dim: Int? = nil) throws -> [Float] {
         let (pv, gh, gw) = try preprocessor.pixelValues(rgb: rgb, h: h, w: w)
-        guard gh * gw <= maxPatches else { throw VisionCoreMLEncoderMasked.EncoderError.noOutput }
+        guard gh * gw <= maxPatches else { throw VisionCoreMLEncoderMasked.EncoderError.tooLarge(gh * gw) }
         return try embed(pixelValues: pv, gh: gh, gw: gw, dim: dim)
     }
 

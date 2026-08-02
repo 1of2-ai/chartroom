@@ -8,6 +8,10 @@ import JinaEmbeddings
 /// Jina model bundle ships only those two files. Rather than mutate the (git-ignored,
 /// externally managed) bundle, this stages a sibling folder that symlinks the real
 /// tokenizer files and adds a minimal `config.json`. Shared by every Jina-backed provider.
+enum JinaTokenizerStagingError: Error, Equatable {
+    case missingTokenizerArtifact(path: String)
+}
+
 enum JinaTokenizerStaging {
     private static let lock = NSLock()
 
@@ -40,9 +44,15 @@ enum JinaTokenizerStaging {
 
         try fm.createDirectory(at: staged, withIntermediateDirectories: true)
         for file in ["tokenizer.json", "tokenizer_config.json"] {
+            let target = original.appendingPathComponent(file)
+            // `createSymbolicLink` happily creates dangling links; a missing original
+            // must fail here, not later as an opaque AutoTokenizer load error.
+            guard fm.fileExists(atPath: target.path) else {
+                throw JinaTokenizerStagingError.missingTokenizerArtifact(path: target.path)
+            }
             let link = staged.appendingPathComponent(file)
             try? fm.removeItem(at: link)
-            try fm.createSymbolicLink(at: link, withDestinationURL: original.appendingPathComponent(file))
+            try fm.createSymbolicLink(at: link, withDestinationURL: target)
         }
         try Data(#"{"model_type":"qwen2"}"#.utf8)
             .write(to: staged.appendingPathComponent("config.json"))
