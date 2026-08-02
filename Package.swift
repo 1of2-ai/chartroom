@@ -3,7 +3,7 @@ import PackageDescription
 
 // Chartroom — the local-first hybrid retrieval engine.
 //
-// A distributable package of six layered libraries, one external dependency:
+// A distributable package of six layered libraries, two external dependencies:
 //
 //   IndexEngine      SQLite FTS5 (BM25) + exact vector cosine, fused with Reciprocal Rank
 //                    Fusion. Built on the system SQLite, so it has no external dependencies
@@ -31,6 +31,7 @@ let package = Package(
         .library(name: "ChartroomControl", targets: ["ChartroomControl"]),
     ],
     dependencies: [
+        .package(name: "GlossematicsSDK", url: "https://github.com/1of2-ai/GlossematicsSDK", from: "0.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.17"),
     ],
     targets: [
@@ -74,6 +75,11 @@ let package = Package(
 
         .target(name: "ChartroomControl", dependencies: ["ConnectorEngine", "IndexEngine", "SyncEngine"]),
         .testTarget(name: "ChartroomControlTests", dependencies: ["ChartroomControl", "ChartroomTestSupport", "ConnectorEngine", "IndexEngine"]),
+
+        .testTarget(
+            name: "GlossematicsSDKTests",
+            dependencies: [.product(name: "Glossematics", package: "GlossematicsSDK")]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
