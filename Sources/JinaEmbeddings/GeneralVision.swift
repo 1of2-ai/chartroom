@@ -37,15 +37,22 @@ public enum JinaVideoFile {
         guard seconds > 0 else { throw DecodeError.noVideoTrack }
         var frames = [[UInt8]]()
         frames.reserveCapacity(count)
-        for i in 0..<count {
-            let frac = count == 1 ? 0 : Double(i) / Double(count - 1)
-            let t = CMTime(seconds: seconds * frac, preferredTimescale: 600)
+        for (i, sampleSeconds) in Self.frameSampleSeconds(duration: seconds, count: count).enumerated() {
+            let t = CMTime(seconds: sampleSeconds, preferredTimescale: 600)
             do {
                 let (cg, _) = try await gen.image(at: t)
                 frames.append(try preprocessor.resizedRGB(cg, w: size, h: size))
             } catch { throw DecodeError.frameFailed(i) }
         }
         return frames
+    }
+
+    /// Mid-bin sample times: frame i at the center of the i-th of `count` equal bins.
+    /// Every time is strictly inside [0, duration) — endpoint sampling requested
+    /// t == duration with zero tolerance, which some assets reject outright.
+    static func frameSampleSeconds(duration: Double, count: Int) -> [Double] {
+        guard count > 0, duration > 0 else { return [] }
+        return (0..<count).map { duration * (Double($0) + 0.5) / Double(count) }
     }
 }
 

@@ -475,6 +475,49 @@ struct UserDefaultsCursorStoreTests {
 
 @Suite("LocalFileRetry")
 struct LocalFileRetryTests {
+    @Test("retry re-applies the connector's file policy, not just existence")
+    func retryReappliesFilePolicy() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "sync-engine-retry-policy-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let outside = FileManager.default.temporaryDirectory
+            .appending(path: "sync-engine-retry-outside-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+
+        // The file recorded at sync time has since been replaced by a symlink to a
+        // secret outside the tree — the exact swap the connector's scan rejects.
+        let secretURL = outside.appending(path: "secret.md")
+        try "credential material".write(to: secretURL, atomically: true, encoding: .utf8)
+        let swappedURL = root.appending(path: "Swapped.md")
+        try FileManager.default.createSymbolicLink(at: swappedURL, withDestinationURL: secretURL)
+
+        let grownURL = root.appending(path: "Grown.md")
+        try String(repeating: "x", count: 4096).write(to: grownURL, atomically: true, encoding: .utf8)
+
+        let wrongTypeURL = root.appending(path: "Binary.bin")
+        try Data([0x00, 0x01]).write(to: wrongTypeURL)
+
+        let validURL = root.appending(path: "Valid.md")
+        try "still fine".write(to: validURL, atomically: true, encoding: .utf8)
+
+        let failures = [
+            failure(documentID: "local-files:Swapped.md", sourceID: "local-files", sourceURI: swappedURL),
+            failure(documentID: "local-files:Grown.md", sourceID: "local-files", sourceURI: grownURL),
+            failure(documentID: "local-files:Binary.bin", sourceID: "local-files", sourceURI: wrongTypeURL),
+            failure(documentID: "local-files:Valid.md", sourceID: "local-files", sourceURI: validURL),
+        ]
+        let payloads = LocalFileRetry.payloads(
+            for: failures,
+            options: .init(allowedPathExtensions: ["md"], maxFileSizeBytes: 1024)
+        )
+
+        #expect(payloads.map(\.documentID) == ["local-files:Valid.md"])
+    }
+
     @Test("rebuilds payloads only for local-file failures whose file still exists")
     func rebuildsPayloadsForExistingLocalFiles() throws {
         let root = FileManager.default.temporaryDirectory

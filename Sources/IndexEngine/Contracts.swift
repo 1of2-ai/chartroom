@@ -187,9 +187,10 @@ public struct IndexEngineConfiguration: Sendable {
 }
 
 public extension IndexEngineClient {
-    func documents(limit: Int) async -> [DocumentSummary] {
-        let request = DocumentBrowseRequest(limit: limit)
-        return (try? await browseDocuments(request).documents) ?? []
+    /// Throws rather than mapping storage failures to an empty list — a disk error
+    /// must never be indistinguishable from an empty corpus.
+    func documents(limit: Int) async throws -> [DocumentSummary] {
+        try await browseDocuments(DocumentBrowseRequest(limit: limit)).documents
     }
 }
 

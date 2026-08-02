@@ -25,6 +25,20 @@ struct ResourceLoadingTests {
         return url
     }
 
+    @Test("video frame sample times stay strictly inside the asset's duration")
+    func frameSampleTimesStayInsideDuration() {
+        for (duration, count) in [(10.0, 8), (0.04, 1), (3600.0, 32), (1.0, 2)] {
+            let times = JinaVideoFile.frameSampleSeconds(duration: duration, count: count)
+            #expect(times.count == count)
+            for t in times {
+                #expect(t >= 0 && t < duration, "t=\(t) outside [0, \(duration)) for count \(count)")
+            }
+            #expect(times == times.sorted())
+        }
+        #expect(JinaVideoFile.frameSampleSeconds(duration: 0, count: 4).isEmpty)
+        #expect(JinaVideoFile.frameSampleSeconds(duration: 5, count: 0).isEmpty)
+    }
+
     @Test("a trailing partial word is rejected, not truncated")
     func partialWordRejected() throws {
         let url = try write([0, 0, 128, 63, 0, 0, 128], name: "truncated.f32") // 7 bytes

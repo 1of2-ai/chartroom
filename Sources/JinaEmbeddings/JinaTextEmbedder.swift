@@ -88,12 +88,28 @@ public final class JinaTextEmbedder: @unchecked Sendable {
         guard let bucket = buckets.first(where: { $0 >= n }) ?? buckets.last else {
             throw TextEmbedderError.noBucketsConfigured
         }
-        cacheLock.lock(); defer { cacheLock.unlock() }
-        if let e = cache[bucket] { return (e, bucket) }
+        cacheLock.lock()
+        if let e = cache[bucket] {
+            cacheLock.unlock()
+            return (e, bucket)
+        }
+        cacheLock.unlock()
+
+        // Load outside the lock — an MLModel load takes seconds, and holding the lock
+        // across it stalls concurrent embeds whose bucket is already resident.
         let fn = isMultiFunction ? "bucket_\(bucket)" : nil
-        let e = try CoreMLTextEncoder(modelURL: compiledURL, computeUnits: units(forBucket: bucket), functionName: fn)
-        cache[bucket] = e
-        return (e, bucket)
+        let built = try CoreMLTextEncoder(modelURL: compiledURL, computeUnits: units(forBucket: bucket), functionName: fn)
+
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if let winner = cache[bucket] { return (winner, bucket) }
+        cache[bucket] = built
+        return (built, bucket)
+    }
+
+    /// Release every resident bucket model. The next embed reloads what it needs.
+    public func unloadAll() {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        cache.removeAll()
     }
 
     /// Embed text. `dim` truncates to a Matryoshka dimension (re-normalized); nil = full 1024.

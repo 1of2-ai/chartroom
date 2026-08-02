@@ -649,7 +649,7 @@ struct IndexEngineFacadeTests {
         #expect(remaining.documents.map(\.id) == ["doc-new"])
 
         // The limit is honored and a non-positive limit returns nothing.
-        #expect(await engine.documents(limit: 0).isEmpty)
+        #expect(try await engine.documents(limit: 0).isEmpty)
     }
 
     @Test("document browsing honors query, filters, sort, and paging")

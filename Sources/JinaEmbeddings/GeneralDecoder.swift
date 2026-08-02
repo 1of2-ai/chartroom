@@ -65,19 +65,42 @@ public final class GeneralMediaDecoder: @unchecked Sendable {
     func units(forS S: Int) -> MLComputeUnits { forcedUnits ?? (S <= 256 ? .cpuAndNeuralEngine : .cpuAndGPU) }
 
     private func embedModel(_ S: Int) throws -> MLModel {
-        lock.lock(); defer { lock.unlock() }
-        if let m = embedModels[S] { return m }
-        let cfg = MLModelConfiguration(); cfg.computeUnits = units(forS: S); cfg.functionName = "f\(S)"
-        let m = try MLModel(contentsOf: embedCompiled, configuration: cfg)
-        embedModels[S] = m; return m
+        try cachedModel(S, in: \.embedModels, from: embedCompiled)
     }
 
     private func decoderModel(_ S: Int) throws -> MLModel {
-        lock.lock(); defer { lock.unlock() }
-        if let m = decoderModels[S] { return m }
+        try cachedModel(S, in: \.decoderModels, from: decoderCompiled)
+    }
+
+    /// Double-checked: the multi-second MLModel load happens outside the lock so a
+    /// concurrent decode whose bucket is already resident never stalls behind it.
+    /// On a race, the first resident model wins and the duplicate is discarded.
+    private func cachedModel(
+        _ S: Int,
+        in path: ReferenceWritableKeyPath<GeneralMediaDecoder, [Int: MLModel]>,
+        from compiled: URL
+    ) throws -> MLModel {
+        lock.lock()
+        if let m = self[keyPath: path][S] {
+            lock.unlock()
+            return m
+        }
+        lock.unlock()
+
         let cfg = MLModelConfiguration(); cfg.computeUnits = units(forS: S); cfg.functionName = "f\(S)"
-        let m = try MLModel(contentsOf: decoderCompiled, configuration: cfg)
-        decoderModels[S] = m; return m
+        let built = try MLModel(contentsOf: compiled, configuration: cfg)
+
+        lock.lock(); defer { lock.unlock() }
+        if let winner = self[keyPath: path][S] { return winner }
+        self[keyPath: path][S] = built
+        return built
+    }
+
+    /// Release every resident bucket model. The next decode reloads what it needs.
+    public func unloadAll() {
+        lock.lock(); defer { lock.unlock() }
+        embedModels.removeAll()
+        decoderModels.removeAll()
     }
 
     /// `tokenIds` = the full real sequence (prefix + media pads + suffix), length ≤ S.
