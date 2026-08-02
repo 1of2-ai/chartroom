@@ -473,7 +473,7 @@ public actor ChartroomSession {
     /// Every sync runs under a control the session can reach: the caller's when supplied,
     /// a session-created one otherwise. `close()` stops whatever is registered, which is
     /// how in-flight work observes the lifecycle without the session owning its task.
-    private func withRegisteredSyncControl<T>(
+    private func withRegisteredSyncControl<T: Sendable>(
         _ control: SyncControl?,
         operation: (SyncControl) async throws -> T
     ) async rethrows -> T {
