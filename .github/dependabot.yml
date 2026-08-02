@@ -1,0 +1,8 @@
+# Keeps SHA-pinned actions current: dependabot proposes pin bumps as PRs,
+# which run through CI like any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
