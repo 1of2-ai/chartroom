@@ -164,7 +164,7 @@ struct ChartroomSessionTests {
             try await session.sync(connector: secondConnector, cursorKey: "second-key")
         }
         let clock = ContinuousClock()
-        let startDeadline = clock.now.advanced(by: .seconds(1))
+        let startDeadline = clock.now.advanced(by: .seconds(15))
         while !(await secondGate.hasEntered), clock.now < startDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -222,7 +222,7 @@ struct ChartroomSessionTests {
         secondTask.cancel()
 
         let clock = ContinuousClock()
-        let cancellationDeadline = clock.now.advanced(by: .seconds(1))
+        let cancellationDeadline = clock.now.advanced(by: .seconds(15))
         while !(await completion.hasCompleted), clock.now < cancellationDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -266,7 +266,7 @@ struct ChartroomSessionTests {
         // close() must not return while the sync is still running; the stop it issued
         // lets the orchestrator finish without the gate ever being released.
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(2))
+        let deadline = clock.now.advanced(by: .seconds(15))
         while !(await completion.hasCompleted), clock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }

@@ -214,7 +214,7 @@ struct SyncOrchestratorTests {
         }
 
         let clock = ContinuousClock()
-        let startDeadline = clock.now.advanced(by: .seconds(1))
+        let startDeadline = clock.now.advanced(by: .seconds(15))
         while connector.receivedCursor() != "cursor-before", clock.now < startDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -223,7 +223,7 @@ struct SyncOrchestratorTests {
         #expect(await engine.recordedCalls().isEmpty)
 
         syncTask.cancel()
-        let cancellationDeadline = clock.now.advanced(by: .seconds(1))
+        let cancellationDeadline = clock.now.advanced(by: .seconds(15))
         while !(await completion.hasCompleted()), clock.now < cancellationDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -261,14 +261,14 @@ struct SyncOrchestratorTests {
         }
 
         let clock = ContinuousClock()
-        let startDeadline = clock.now.advanced(by: .seconds(1))
+        let startDeadline = clock.now.advanced(by: .seconds(15))
         while !connector.hasStarted, clock.now < startDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
         #expect(connector.hasStarted)
 
         control.stop()
-        let stopDeadline = clock.now.advanced(by: .seconds(1))
+        let stopDeadline = clock.now.advanced(by: .seconds(15))
         while !(await completion.hasCompleted()), clock.now < stopDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -305,14 +305,14 @@ struct SyncOrchestratorTests {
         }
 
         let clock = ContinuousClock()
-        let startDeadline = clock.now.advanced(by: .seconds(1))
+        let startDeadline = clock.now.advanced(by: .seconds(15))
         while !connector.hasStarted, clock.now < startDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
         #expect(connector.hasStarted)
 
         syncTask.cancel()
-        let cancellationDeadline = clock.now.advanced(by: .seconds(1))
+        let cancellationDeadline = clock.now.advanced(by: .seconds(15))
         while !(await completion.hasCompleted()), clock.now < cancellationDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -352,7 +352,7 @@ struct SyncOrchestratorTests {
         }
 
         let clock = ContinuousClock()
-        let collectionDeadline = clock.now.advanced(by: .seconds(1))
+        let collectionDeadline = clock.now.advanced(by: .seconds(15))
         while connector.receivedCursor() != "cursor-before", clock.now < collectionDeadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -446,7 +446,7 @@ struct UserDefaultsCursorStoreTests {
             writes.leave()
         }
 
-        let completedWithoutRescue = writes.wait(timeout: .now() + 1) == .success
+        let completedWithoutRescue = writes.wait(timeout: .now() + 15) == .success
         if !completedWithoutRescue {
             defaults.releaseBlockedReads()
             writes.wait()

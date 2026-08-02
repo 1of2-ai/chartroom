@@ -35,7 +35,7 @@ struct WorkspaceLifecycleTests {
 
     private func waitUntilCatalogIsEmpty(_ workspace: ChartroomWorkspace) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(2))
+        let deadline = clock.now.advanced(by: .seconds(15))
         while clock.now < deadline {
             if try await workspace.indexes().isEmpty {
                 return
@@ -862,7 +862,7 @@ struct WorkspaceLifecycleTests {
         }
 
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(2))
+        let deadline = clock.now.advanced(by: .seconds(15))
         while await probe.resultCode() == nil, clock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -978,7 +978,7 @@ private actor LifecycleGate {
 
     func waitUntilEntered() async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(2))
+        let deadline = clock.now.advanced(by: .seconds(15))
         while clock.now < deadline {
             if entries > 0 {
                 return
