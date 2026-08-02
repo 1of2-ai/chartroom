@@ -67,9 +67,11 @@ public struct VisionPositions {
     public struct Meta: Decodable {
         public let num_grid_per_side: Int; public let hidden: Int; public let spatial_merge_size: Int
         public let patch_size: Int; public let rope_theta: Double
+        // Optional: older meta.json files predate the field; when present it pins invFreq's length.
+        public let rope_inv_freq_len: Int?
     }
 
-    public enum PosError: Error { case badTable }
+    public enum PosError: Error { case badTable, badInvFreq }
 
     public init(metaURL: URL, posTableURL: URL, invFreqURL: URL) throws {
         let m = try JSONDecoder().decode(Meta.self, from: Data(contentsOf: metaURL))
@@ -78,6 +80,9 @@ public struct VisionPositions {
         posTable = try loadF32(posTableURL)
         invFreq = try loadF32(invFreqURL)
         guard posTable.count == numGridPerSide * numGridPerSide * hidden else { throw VisionPositions.PosError.badTable }
+        if let expected = m.rope_inv_freq_len, invFreq.count != expected {
+            throw VisionPositions.PosError.badInvFreq
+        }
     }
 
     /// linspace(0, side-1, n) matching torch.linspace.

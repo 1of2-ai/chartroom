@@ -34,6 +34,49 @@ struct IndexEngineJinaTests {
         #expect(JinaModelBundleLocator.isValidBundle(tmp) == false)
     }
 
+    @Test("locator rejects a bundle whose vision resources folder is missing the files the towers load")
+    func locatorRejectsIncompleteVisionResources() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vision-incomplete-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let manifest = JinaModelBundle.Manifest.default
+        try JSONEncoder().encode(manifest).write(to: tmp.appendingPathComponent("manifest.json"))
+        let bundle = try JinaModelBundle(url: tmp)
+
+        let touch = { (url: URL) throws in
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try Data().write(to: url)
+        }
+        let tokenizerFolder = bundle.resolve(manifest.text.tokenizer)
+        for artifact in [
+            bundle.resolve(manifest.text.model),
+            tokenizerFolder.appendingPathComponent("tokenizer.json"),
+            tokenizerFolder.appendingPathComponent("tokenizer_config.json"),
+            bundle.resolve(manifest.image.encoder),
+            bundle.resolve(manifest.audio.encoder),
+            bundle.resolve(manifest.video.encoder),
+            bundle.resolve(manifest.decoder.embed),
+            bundle.resolve(manifest.decoder.model),
+        ] {
+            try touch(artifact)
+        }
+        let resources = bundle.resolve(manifest.image.resources)
+        for file in ["meta.json", "pos_embed_table.f32", "rope_inv_freq.f32"] {
+            try touch(resources.appendingPathComponent(file))
+        }
+
+        #expect(JinaModelBundleLocator.isValidBundle(tmp))
+
+        // A resources folder that exists but lacks a file the image tower loads by
+        // name must not validate as model-backed.
+        try FileManager.default.removeItem(at: resources.appendingPathComponent("meta.json"))
+        #expect(JinaModelBundleLocator.isValidBundle(tmp) == false)
+    }
+
     @Test(
         "locator discovers the bundled model resource when LFS payloads are present",
         .enabled(if: IndexEngineJinaTests.repoBundle != nil)

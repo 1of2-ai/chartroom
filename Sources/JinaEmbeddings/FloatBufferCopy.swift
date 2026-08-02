@@ -2,11 +2,19 @@ import Foundation
 
 enum FloatBufferCopyError: Error, Equatable {
     case countExceedsSource(requested: Int, available: Int)
+    case misalignedFloatData(path: String, byteCount: Int)
 }
 
 /// Raw little-endian float32 file -> [Float]; shared by every resource loader.
+/// A byte count that is not a whole number of floats is a corrupt resource —
+/// `bindMemory` would floor-divide it into fewer floats and the damage would
+/// surface later as an unrelated shape mismatch, far from the actual cause.
 func loadF32(_ url: URL) throws -> [Float] {
-    try Data(contentsOf: url).withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    let data = try Data(contentsOf: url)
+    guard data.count.isMultiple(of: MemoryLayout<Float>.size) else {
+        throw FloatBufferCopyError.misalignedFloatData(path: url.path, byteCount: data.count)
+    }
+    return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
 }
 
 func copyFloats(_ source: [Float], to destination: UnsafeMutablePointer<Float>, count: Int) throws {

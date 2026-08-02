@@ -58,12 +58,18 @@ public enum JinaModelBundleLocator {
     private static func requiredArtifactURLs(for bundle: JinaModelBundle) -> [URL] {
         let manifest = bundle.manifest
         let tokenizerFolder = bundle.resolve(manifest.text.tokenizer)
+        let visionResources = bundle.resolve(manifest.image.resources)
         return [
             bundle.resolve(manifest.text.model),
             tokenizerFolder.appendingPathComponent("tokenizer.json"),
             tokenizerFolder.appendingPathComponent("tokenizer_config.json"),
             bundle.resolve(manifest.image.encoder),
-            bundle.resolve(manifest.image.resources),
+            // The files the image/video towers load by name, not just their folder —
+            // a folder that exists but is missing one would validate as model-backed
+            // and then fail on the first image embed, far from the misconfiguration.
+            visionResources.appendingPathComponent("meta.json"),
+            visionResources.appendingPathComponent("pos_embed_table.f32"),
+            visionResources.appendingPathComponent("rope_inv_freq.f32"),
             bundle.resolve(manifest.audio.encoder),
             bundle.resolve(manifest.video.encoder),
             bundle.resolve(manifest.decoder.embed),
