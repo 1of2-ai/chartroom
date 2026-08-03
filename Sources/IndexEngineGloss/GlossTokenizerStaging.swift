@@ -1,23 +1,23 @@
 import Foundation
-import JinaEmbeddings
+import Glossematics
 
 /// Resolves a tokenizer folder that `swift-transformers` can load.
 ///
 /// `AutoTokenizer.from(modelFolder:)` requires a `config.json` to *exist* even though it
 /// builds the BPE tokenizer purely from `tokenizer.json` + `tokenizer_config.json`. The
-/// Jina model bundle ships only those two files. Rather than mutate the (git-ignored,
+/// model bundle ships only those two files. Rather than mutate the (git-ignored,
 /// externally managed) bundle, this stages a sibling folder that symlinks the real
-/// tokenizer files and adds a minimal `config.json`. Shared by every Jina-backed provider.
-enum JinaTokenizerStagingError: Error, Equatable {
+/// tokenizer files and adds a minimal `config.json`. Shared by every Gloss-backed provider.
+enum GlossTokenizerStagingError: Error, Equatable {
     case missingTokenizerArtifact(path: String)
 }
 
-enum JinaTokenizerStaging {
+enum GlossTokenizerStaging {
     private static let lock = NSLock()
 
-    /// The folder to hand to a Jina text embedder: the bundle's own tokenizer folder when it
+    /// The folder to hand to a Gloss text embedder: the bundle's own tokenizer folder when it
     /// already has `config.json`, otherwise a staged folder that adds one.
-    static func resolvedFolder(for bundle: JinaModelBundle) throws -> URL {
+    static func resolvedFolder(for bundle: GlossModelBundle) throws -> URL {
         let original = bundle.resolve(bundle.manifest.text.tokenizer)
         let fm = FileManager.default
         if fm.fileExists(atPath: original.appendingPathComponent("config.json").path) {
@@ -29,7 +29,7 @@ enum JinaTokenizerStaging {
         let cachesRoot = (try? fm.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
             ?? fm.temporaryDirectory
         let staged = cachesRoot
-            .appendingPathComponent("IndexEngineJina-tokenizer", isDirectory: true)
+            .appendingPathComponent("IndexEngineGloss-tokenizer", isDirectory: true)
             .appendingPathComponent(stableKey(for: original.path), isDirectory: true)
 
         // Concurrent loaders of the same bundle would otherwise race on the shared staged
@@ -48,7 +48,7 @@ enum JinaTokenizerStaging {
             // `createSymbolicLink` happily creates dangling links; a missing original
             // must fail here, not later as an opaque AutoTokenizer load error.
             guard fm.fileExists(atPath: target.path) else {
-                throw JinaTokenizerStagingError.missingTokenizerArtifact(path: target.path)
+                throw GlossTokenizerStagingError.missingTokenizerArtifact(path: target.path)
             }
             let link = staged.appendingPathComponent(file)
             try? fm.removeItem(at: link)

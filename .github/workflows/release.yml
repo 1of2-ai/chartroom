@@ -43,7 +43,7 @@ jobs:
       - name: Fetch model payloads
         run: |
           git lfs pull \
-            --include "Sources/IndexEngineJina/Resources/CoreML/JinaV5OmniSmall.bundle/**" \
+            --include "Sources/IndexEngineGloss/Resources/CoreML/JinaV5OmniSmall.bundle/**" \
             --exclude ""
 
       - name: Package model assets

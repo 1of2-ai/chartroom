@@ -1,19 +1,19 @@
 import Foundation
 import IndexEngine
 import Testing
-@testable import IndexEngineJina
+@testable import IndexEngineGloss
 
 /// Guards the one number that decides whether a vector hit counts as an answer.
 ///
-/// `JinaSimilarity.weakThreshold` was derived from the distributions below rather than assumed, so
+/// `GlossSimilarity.weakThreshold` was derived from the distributions below rather than assumed, so
 /// the constant is only defensible while the distributions still hold. This re-derives them against
-/// the live model: if a Jina revision moves either population across the threshold, this fails here
+/// the live model: if a model revision moves either population across the threshold, this fails here
 /// rather than silently changing what every client treats as a result.
 ///
 /// Gated on the model bundle like the other model-backed tests — a pointer-only checkout skips.
-@Suite("Jina similarity calibration")
-struct JinaSimilarityCalibrationTests {
-    static let bundle: URL? = JinaModelBundleLocator.locate()
+@Suite("Gloss similarity calibration")
+struct GlossSimilarityCalibrationTests {
+    static let bundle: URL? = GlossModelBundleLocator.locate()
 
     /// Disjoint topics with no shared content words: the noise floor the threshold must clear.
     static let unrelatedPairs: [(String, String)] = [
@@ -43,12 +43,12 @@ struct JinaSimilarityCalibrationTests {
 
     @Test(
         "the weak threshold separates unrelated text from restatements on the live model",
-        .enabled(if: JinaSimilarityCalibrationTests.bundle != nil)
+        .enabled(if: GlossSimilarityCalibrationTests.bundle != nil)
     )
     func thresholdSeparatesPopulations() async throws {
         let bundleURL = try #require(Self.bundle)
-        let provider = try await JinaTextEmbeddingProvider.load(bundleURL: bundleURL)
-        let threshold = JinaSimilarity.weakThreshold
+        let provider = try await GlossTextEmbeddingProvider.load(bundleURL: bundleURL)
+        let threshold = GlossSimilarity.weakThreshold
 
         func similarity(_ query: String, _ document: String) async throws -> Float {
             let q = try await provider.embed(query, kind: .query)
@@ -77,6 +77,6 @@ struct JinaSimilarityCalibrationTests {
     /// default that used to be inherited from the protocol.
     @Test("both providers report the calibrated threshold rather than inheriting one")
     func providersStateTheirOwnThreshold() {
-        #expect(JinaSimilarity.weakThreshold > HashingEmbedder().weakSimilarityThreshold)
+        #expect(GlossSimilarity.weakThreshold > HashingEmbedder().weakSimilarityThreshold)
     }
 }

@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import IndexEngineJina
+@testable import IndexEngineGloss
 
 @Suite("TextComputePreference policy")
 struct TextComputePolicyTests {

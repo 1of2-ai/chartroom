@@ -1,2 +1,2 @@
 [lfs]
-	fetchexclude = Sources/IndexEngineJina/Resources/CoreML/JinaV5OmniSmall.bundle/**
+	fetchexclude = Sources/IndexEngineGloss/Resources/CoreML/JinaV5OmniSmall.bundle/**

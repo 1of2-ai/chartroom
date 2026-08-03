@@ -2,7 +2,7 @@ import CoreML
 import Foundation
 import IndexEngine
 
-/// Where the Jina text tower runs. Measured on Apple silicon, the Neural Engine embeds at a
+/// Where the text tower runs. Measured on Apple silicon, the Neural Engine embeds at a
 /// fraction of the GPU's power (≈5 W vs ≈67 W → ~6.7× less energy per embedding) at roughly
 /// half the throughput, so `efficiency` is the default and the right choice on battery.
 public enum TextComputePreference: String, CaseIterable, Sendable {
@@ -52,17 +52,17 @@ public extension TextComputePreference {
 /// Entry point for resolving the engine's embedding provider with a graceful fallback.
 ///
 /// Apps call `resolveEmbedder` at startup and hand the result to
-/// `IndexEngineConfiguration`. When the Jina model bundle is present the engine gets
-/// real semantic vectors; when it is absent (CI, a fresh checkout, a machine without
-/// the multi-gigabyte artifact) the engine transparently falls back to the
-/// dependency-free `HashingEmbedder` so the app still opens and search still runs in a
-/// degraded-but-honest mode.
-public enum IndexEngineJina {
+/// `IndexEngineConfiguration`. When the model bundle is present the engine gets
+/// real semantic vectors through Glossematics; when it is absent (CI, a fresh checkout,
+/// a machine without the multi-gigabyte artifact) the engine transparently falls back to
+/// the dependency-free `HashingEmbedder` so the app still opens and search still runs in
+/// a degraded-but-honest mode.
+public enum IndexEngineGloss {
     /// The embedder chosen for an index, plus enough provenance for the host app to
     /// surface which path is active in its model-status UI.
     public struct ResolvedEmbedder: Sendable {
         public let embedder: any Embedder
-        /// True when the real Jina model loaded; false when falling back to the mock.
+        /// True when the real model loaded; false when falling back to the mock.
         public let isModelBacked: Bool
         /// Human-readable detail for diagnostics and model-status display.
         public let detail: String
@@ -80,26 +80,27 @@ public enum IndexEngineJina {
         additionalCandidates: [URL] = [],
         compute: TextComputePreference = .efficiency
     ) async -> ResolvedEmbedder {
-        guard let bundleURL = JinaModelBundleLocator.locate(additionalCandidates: additionalCandidates) else {
+        guard let bundleURL = GlossModelBundleLocator.locate(additionalCandidates: additionalCandidates) else {
             return ResolvedEmbedder(
                 embedder: HashingEmbedder(),
                 isModelBacked: false,
-                detail: "Jina model bundle not found; using hashing mock embedder."
+                detail: "Model bundle not found; using hashing mock embedder."
             )
         }
 
         do {
-            let provider = try await JinaOmniEmbeddingProvider.load(bundleURL: bundleURL, compute: compute)
+            let provider = try await GlossOmniEmbeddingProvider.load(bundleURL: bundleURL, compute: compute)
+            let modalities = provider.supportsImageEmbedding ? "text + image" : "text"
             return ResolvedEmbedder(
                 embedder: provider,
                 isModelBacked: true,
-                detail: "Jina omni embeddings (\(provider.modelID), \(provider.dimension)d, text + image) on \(compute.displayName)."
+                detail: "Glossematics embeddings (\(provider.modelID), \(provider.dimension)d, \(modalities)) on \(compute.displayName)."
             )
         } catch {
             return ResolvedEmbedder(
                 embedder: HashingEmbedder(),
                 isModelBacked: false,
-                detail: "Jina model load failed (\(error)); using hashing mock embedder."
+                detail: "Model load failed (\(error)); using hashing mock embedder."
             )
         }
     }

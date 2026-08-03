@@ -5,7 +5,7 @@ import Foundation
 /// Both providers embed text through the same tower into the same 1024-d space, so the
 /// distribution — and therefore the threshold — is a property of the model, not of the provider
 /// that wraps it. One constant is what stops the two drifting apart.
-public enum JinaSimilarity {
+public enum GlossSimilarity {
     /// Cosine below which a vector-only hit is tail rather than an answer.
     ///
     /// Measured on `jinaai/jina-embeddings-v5-omni-small` at 1024-d, query/document prompts,
@@ -24,7 +24,7 @@ public enum JinaSimilarity {
     /// visible failure for a silent one.
     ///
     /// Small samples, so this is a calibration point rather than a tuned value.
-    /// `JinaSimilarityCalibrationTests` re-derives both populations against the live model and
+    /// `GlossSimilarityCalibrationTests` re-derives both populations against the live model and
     /// fails if this constant stops separating them.
     public static let weakThreshold: Float = 0.25
 }

@@ -11,11 +11,11 @@
 # Usage: Scripts/package-model-assets.sh [output-dir]   (default: dist)
 #
 # Requires the real LFS payloads to be present locally, e.g.:
-#   git lfs pull --include "Sources/IndexEngineJina/Resources/CoreML/JinaV5OmniSmall.bundle/**" --exclude ""
+#   git lfs pull --include "Sources/IndexEngineGloss/Resources/CoreML/JinaV5OmniSmall.bundle/**" --exclude ""
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUNDLE_PARENT="$REPO_ROOT/Sources/IndexEngineJina/Resources/CoreML"
+BUNDLE_PARENT="$REPO_ROOT/Sources/IndexEngineGloss/Resources/CoreML"
 BUNDLE_NAME="JinaV5OmniSmall.bundle"
 OUT_DIR="$(cd "$REPO_ROOT" && mkdir -p "${1:-dist}" && cd "${1:-dist}" && pwd)"
 
@@ -29,7 +29,7 @@ pointer_hits=$(grep -rl "https://git-lfs.github.com/spec" "$BUNDLE_PARENT/$BUNDL
 first_weight=$(find "$BUNDLE_PARENT/$BUNDLE_NAME" -name "weight.bin" -size -1k | head -1)
 if [[ -n "$pointer_hits" || -n "$first_weight" ]]; then
     echo "error: bundle contains LFS pointer files, not real payloads." >&2
-    echo "Run: git lfs pull --include \"Sources/IndexEngineJina/Resources/CoreML/$BUNDLE_NAME/**\" --exclude \"\"" >&2
+    echo "Run: git lfs pull --include \"Sources/IndexEngineGloss/Resources/CoreML/$BUNDLE_NAME/**\" --exclude \"\"" >&2
     exit 1
 fi
 
