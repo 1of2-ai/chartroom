@@ -1,42 +1,70 @@
 import Foundation
 import Glossematics
 
-/// Resolves the on-disk location of the `JinaV5OmniSmall.bundle` Core ML artifact.
+/// Resolves the on-disk location of a Gloss model bundle.
 ///
-/// The bundle is large (multi-gigabyte) and distributed as release assets rather than
-/// through the package checkout (`.lfsconfig` excludes it from LFS smudge, so SwiftPM
+/// Bundles are large (multi-gigabyte) and distributed as release assets rather than
+/// through the package checkout (`.lfsconfig` excludes them from LFS smudge, so SwiftPM
 /// checkouts contain pointer files only). Callers use `locate` to discover a staged copy
 /// and fall back to the mock embedder when it is absent (see `IndexEngineGloss.resolveEmbedder`).
 ///
 /// Resolution order, first valid wins:
-/// 1. `JINA_MODEL_BUNDLE` environment override (absolute path to the bundle). The key
-///    predates the Glossematics migration and stays, because deployments already set it.
-/// 2. A `JinaV5OmniSmall.bundle` resource copied into the host app bundle.
+/// 1. The profile's environment override (absolute path to the bundle).
+/// 2. A bundle resource copied into the host app bundle, under the profile's name.
 /// 3. Any caller-supplied `additionalCandidates` — the host supplies its own locations,
 ///    e.g. an Application Support install directory or a repo-local development path.
 /// 4. The `IndexEngineGloss` SwiftPM package resource.
 public enum GlossModelBundleLocator {
-    public static let bundleName = "JinaV5OmniSmall.bundle"
-    public static let environmentKey = "JINA_MODEL_BUNDLE"
+    /// The per-model constants of bundle discovery. Validation is manifest-driven and needs no
+    /// profile — any directory that holds a complete Gloss bundle passes `isValidBundle` — so a
+    /// profile exists only where a name must be known *before* anything is on disk: the
+    /// environment key deployments export and the resource name hosts embed.
+    public struct Profile: Sendable {
+        public let bundleName: String
+        public let environmentKey: String
 
-    public static func locate(additionalCandidates: [URL] = []) -> URL? {
-        candidates(additionalCandidates: additionalCandidates).first(where: isValidBundle)
+        /// `bundleName` without its `.bundle` extension, as `Bundle.url(forResource:withExtension:)`
+        /// wants it.
+        var resourceName: String {
+            (bundleName as NSString).deletingPathExtension
+        }
+
+        public init(bundleName: String, environmentKey: String) {
+            self.bundleName = bundleName
+            self.environmentKey = environmentKey
+        }
+
+        /// The shipped default. Both names predate the Glossematics migration and stay,
+        /// because deployments already set the key and embed the resource.
+        public static let jinaV5OmniSmall = Profile(
+            bundleName: "JinaV5OmniSmall.bundle",
+            environmentKey: "JINA_MODEL_BUNDLE"
+        )
     }
 
-    static func candidates(additionalCandidates: [URL]) -> [URL] {
+    public static func locate(
+        profile: Profile = .jinaV5OmniSmall,
+        additionalCandidates: [URL] = []
+    ) -> URL? {
+        candidates(profile: profile, additionalCandidates: additionalCandidates)
+            .first(where: isValidBundle)
+    }
+
+    static func candidates(profile: Profile, additionalCandidates: [URL]) -> [URL] {
         var candidates: [URL] = []
 
-        if let override = ProcessInfo.processInfo.environment[environmentKey], !override.isEmpty {
+        if let override = ProcessInfo.processInfo.environment[profile.environmentKey],
+           !override.isEmpty {
             candidates.append(URL(fileURLWithPath: override))
         }
 
-        if let resource = Bundle.main.url(forResource: "JinaV5OmniSmall", withExtension: "bundle") {
+        if let resource = Bundle.main.url(forResource: profile.resourceName, withExtension: "bundle") {
             candidates.append(resource)
         }
 
         candidates.append(contentsOf: additionalCandidates)
 
-        if let packageResource = Bundle.module.url(forResource: "JinaV5OmniSmall", withExtension: "bundle") {
+        if let packageResource = Bundle.module.url(forResource: profile.resourceName, withExtension: "bundle") {
             candidates.append(packageResource)
         }
         return candidates

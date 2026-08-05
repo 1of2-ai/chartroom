@@ -29,16 +29,23 @@ public final class GlossTextEmbeddingProvider: Embedder, @unchecked Sendable {
     public let dimension: Int
     public let embeddingSpaceID: String
     public let isModelBacked = true
-    public var weakSimilarityThreshold: Float { GlossSimilarity.weakThreshold }
+    public let weakSimilarityThreshold: Float
 
     private let textEmbedder: QueueConfinedGlossTextEmbedder
     private let queue = DispatchQueue(label: "indexengine.gloss.text", qos: .userInitiated)
 
-    init(textEmbedder: GlossTextEmbedder, modelID: String, dimension: Int, embeddingSpaceID: String) {
+    init(
+        textEmbedder: GlossTextEmbedder,
+        modelID: String,
+        dimension: Int,
+        embeddingSpaceID: String,
+        weakSimilarityThreshold: Float
+    ) {
         self.textEmbedder = QueueConfinedGlossTextEmbedder(textEmbedder)
         self.modelID = modelID
         self.dimension = dimension
         self.embeddingSpaceID = embeddingSpaceID
+        self.weakSimilarityThreshold = weakSimilarityThreshold
     }
 
     /// Load the text tower from a converted model bundle directory.
@@ -48,7 +55,8 @@ public final class GlossTextEmbeddingProvider: Embedder, @unchecked Sendable {
     /// is malformed or the model cannot be compiled/loaded.
     public static func load(
         bundleURL: URL,
-        compute: TextComputePreference = .efficiency
+        compute: TextComputePreference = .efficiency,
+        weakSimilarityThresholdOverride: Float? = nil
     ) async throws -> GlossTextEmbeddingProvider {
         let loaded = try GlossBundleLoader.load(url: bundleURL)
         let manifest = loaded.bundle.manifest
@@ -68,7 +76,11 @@ public final class GlossTextEmbeddingProvider: Embedder, @unchecked Sendable {
             textEmbedder: textEmbedder,
             modelID: manifest.modelID,
             dimension: manifest.embeddingDimension,
-            embeddingSpaceID: loaded.embeddingSpaceID
+            embeddingSpaceID: loaded.embeddingSpaceID,
+            weakSimilarityThreshold: GlossWeakSimilarityThreshold.threshold(
+                forModelID: manifest.modelID,
+                override: weakSimilarityThresholdOverride
+            )
         )
     }
 

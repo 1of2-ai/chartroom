@@ -20,7 +20,7 @@ public final class GlossOmniEmbeddingProvider: Embedder, @unchecked Sendable {
     public let embeddingSpaceID: String
     public let supportsImageEmbedding: Bool
     public let isModelBacked = true
-    public var weakSimilarityThreshold: Float { GlossSimilarity.weakThreshold }
+    public let weakSimilarityThreshold: Float
 
     private let omni: GlossOmniEmbedder
     private let textEmbedder: QueueConfinedGlossTextEmbedder
@@ -32,7 +32,8 @@ public final class GlossOmniEmbeddingProvider: Embedder, @unchecked Sendable {
         modelID: String,
         dimension: Int,
         embeddingSpaceID: String,
-        supportsImageEmbedding: Bool
+        supportsImageEmbedding: Bool,
+        weakSimilarityThreshold: Float
     ) {
         self.omni = omni
         self.textEmbedder = QueueConfinedGlossTextEmbedder(textEmbedder)
@@ -40,6 +41,7 @@ public final class GlossOmniEmbeddingProvider: Embedder, @unchecked Sendable {
         self.dimension = dimension
         self.embeddingSpaceID = embeddingSpaceID
         self.supportsImageEmbedding = supportsImageEmbedding
+        self.weakSimilarityThreshold = weakSimilarityThreshold
     }
 
     /// Load the omni model from a converted bundle (v1 manifests migrate in memory).
@@ -47,7 +49,8 @@ public final class GlossOmniEmbeddingProvider: Embedder, @unchecked Sendable {
     /// missing `config.json`.
     public static func load(
         bundleURL: URL,
-        compute: TextComputePreference = .efficiency
+        compute: TextComputePreference = .efficiency,
+        weakSimilarityThresholdOverride: Float? = nil
     ) async throws -> GlossOmniEmbeddingProvider {
         let loaded = try GlossBundleLoader.load(url: bundleURL)
         let manifest = loaded.bundle.manifest
@@ -82,7 +85,11 @@ public final class GlossOmniEmbeddingProvider: Embedder, @unchecked Sendable {
             modelID: manifest.modelID,
             dimension: manifest.embeddingDimension,
             embeddingSpaceID: loaded.embeddingSpaceID,
-            supportsImageEmbedding: loaded.bundle.capabilities.supportsImage
+            supportsImageEmbedding: loaded.bundle.capabilities.supportsImage,
+            weakSimilarityThreshold: GlossWeakSimilarityThreshold.threshold(
+                forModelID: manifest.modelID,
+                override: weakSimilarityThresholdOverride
+            )
         )
     }
 
