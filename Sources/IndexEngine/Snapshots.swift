@@ -780,6 +780,11 @@ public struct ModelStatusSnapshot: Codable, Hashable, Sendable {
     /// model, which is precisely the state this field exists to make visible.
     public var isModelBacked: Bool
 
+    /// Image files embed by content. When false, ingest embeds an image's filename text
+    /// instead — the image stays findable by name, not by what it shows. Surfaced so hosts
+    /// can say which of the two an index actually delivers.
+    public var supportsImageEmbedding: Bool
+
     public var message: String
 
     public init(
@@ -788,6 +793,7 @@ public struct ModelStatusSnapshot: Codable, Hashable, Sendable {
         dimension: Int,
         isAvailable: Bool,
         isModelBacked: Bool,
+        supportsImageEmbedding: Bool = false,
         message: String = ""
     ) {
         self.modelID = modelID
@@ -795,6 +801,7 @@ public struct ModelStatusSnapshot: Codable, Hashable, Sendable {
         self.dimension = dimension
         self.isAvailable = isAvailable
         self.isModelBacked = isModelBacked
+        self.supportsImageEmbedding = supportsImageEmbedding
         self.message = message
     }
 }

@@ -574,6 +574,7 @@ public actor IndexEngine: IndexEngineClient {
             dimension: store.dimension,
             isAvailable: status.isAvailable,
             isModelBacked: isModelBacked,
+            supportsImageEmbedding: store.supportsImageEmbedding,
             message: message
         )
     }

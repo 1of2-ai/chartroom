@@ -53,4 +53,35 @@ struct ModelStatusHonestyTests {
         #expect(HashingEmbedder().isModelBacked == false)
         #expect(ModelBackedFixture().isModelBacked)
     }
+
+    private struct ImageCapableFixture: Embedder {
+        let modelID = "fixture-omni"
+        let dimension = 8
+        let isModelBacked = true
+        let weakSimilarityThreshold: Float = 0.4
+        let supportsImageEmbedding = true
+
+        func embed(_ text: String, kind: EmbedKind) async throws -> [Float] {
+            [Float](repeating: 1 / Float(dimension).squareRoot(), count: dimension)
+        }
+
+        func embedImage(at url: URL) async throws -> [Float] {
+            try await embed(url.lastPathComponent, kind: .document)
+        }
+    }
+
+    /// Text-only models embed an image's *filename*, not its pixels; the status must say which
+    /// an index delivers so hosts don't present name-only image search as content search.
+    @Test("status reports whether images embed by content")
+    func imageCapabilityIsReported() async throws {
+        let textOnly = try await IndexEngine.openInMemory(
+            configuration: .init(embedder: ModelBackedFixture())
+        )
+        #expect(await textOnly.modelStatus().supportsImageEmbedding == false)
+
+        let omni = try await IndexEngine.openInMemory(
+            configuration: .init(embedder: ImageCapableFixture())
+        )
+        #expect(await omni.modelStatus().supportsImageEmbedding)
+    }
 }

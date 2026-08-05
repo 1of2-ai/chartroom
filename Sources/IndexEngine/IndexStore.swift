@@ -138,6 +138,9 @@ public actor IndexStore {
     /// Whether this store's vectors come from a real model. Captured at open beside the other
     /// embedder identity, so status reads it without reaching back through the actor.
     public let isModelBacked: Bool
+    /// Whether image files embed by content. When false, ingest falls back to embedding an
+    /// image's filename text, so images stay findable by name but not by what they show.
+    public let supportsImageEmbedding: Bool
     public let vectorBackendID = EngineID.builtInSQLiteVectorBackend.rawValue
     public let vectorBackendVersion = "1"
 
@@ -158,6 +161,7 @@ public actor IndexStore {
         self.dimension = embedder.dimension
         self.embeddingSpaceID = embedder.embeddingSpaceID
         self.isModelBacked = embedder.isModelBacked
+        self.supportsImageEmbedding = embedder.supportsImageEmbedding
         try Self.installSchema(
             db: db,
             vectorBackendID: vectorBackendID,

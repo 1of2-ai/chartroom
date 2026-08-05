@@ -206,6 +206,7 @@ public struct DiagnosticsBundle: Sendable {
             dimension: status.dimension,
             isAvailable: status.isAvailable,
             isModelBacked: status.isModelBacked,
+            supportsImageEmbedding: status.supportsImageEmbedding,
             message: message
         )
     }
