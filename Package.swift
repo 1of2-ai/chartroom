@@ -16,9 +16,8 @@ import PackageDescription
 //                     image/audio/video into one shared space) behind IndexEngine's Embedder
 //                     protocol.
 //
-// GlossematicsSDK is consumed as a versioned remote dependency; the GlossematicsSDK submodule
-// vendors the same pinned revision for source-of-truth browsing and offline reference. Keep
-// the two pins moving together.
+// GlossematicsSDK is consumed as a versioned remote dependency, pinned by the tracked
+// Package.resolved.
 //
 // One platform floor: IndexEngineGloss and Glossematics require macOS 15 (MLComputePlan),
 // so the whole package floors there.
